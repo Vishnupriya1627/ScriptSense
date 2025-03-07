@@ -1,0 +1,13 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.bg-login {
+  background-image: url('/login_bg.png');
+  background-size: cover;
+  background-position: center;
+  width: 100%; /* Ensure full width */
+  height: 100%; /* Tailwind class for a specific height */
+  margin: 0; /* Remove any default margin */
+  padding: 0; /* Remove any default padding */
+}

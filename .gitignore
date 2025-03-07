@@ -1,0 +1,34 @@
+# Logs
+frontend/my-react-app/logs
+frontend/my-react-app/*.log
+frontend/my-react-app/npm-debug.log*
+frontend/my-react-app/yarn-debug.log*
+frontend/my-react-app/yarn-error.log*
+frontend/my-react-app/pnpm-debug.log*
+frontend/my-react-app/lerna-debug.log*
+
+# Dependencies
+frontend/my-react-app/node_modules
+frontend/my-react-app/dist
+frontend/my-react-app/dist-ssr
+frontend/my-react-app/*.local
+
+# Editor directories and files
+frontend/my-react-app/.vscode/*
+!frontend/my-react-app/.vscode/extensions.json
+frontend/my-react-app/.idea
+frontend/my-react-app/.DS_Store
+frontend/my-react-app/*.suo
+frontend/my-react-app/*.ntvs*
+frontend/my-react-app/*.njsproj
+frontend/my-react-app/*.sln
+frontend/my-react-app/*.sw?
+
+backend/Utils/Images
+backend/output
+
+node_modules/
+frontend/my-react-app/node_modules/
+**/node_modules/
+
+frontend/my-react-app/public/
