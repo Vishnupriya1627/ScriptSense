@@ -14,6 +14,7 @@ from Utils.image_similarity import image_similarity
 import numpy as np
 import os
 import shutil
+import base64
 
 app = FastAPI()
 
@@ -22,7 +23,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins="http://localhost:5173",
     allow_methods=["*"],
-    allow_headers=["*"] #the frontend
+    allow_headers=["*"] 
 )
 
 class AnswerKey(BaseModel):
@@ -62,25 +63,48 @@ async def similarity(
                 segment_lines_and_find_diagrams(np.array(image), output_folder="output", min_height_threshold=30, padding=10, min_contour_width=5000)
 
             text_image = Image.open("output/text.png")
-            texts.append(ocr_from_image(text_image))
-            # texts.append("Machine learning is a branch of artificial intelligence that enables computers to learn the data , identify patterns , and make decisions with minimal human intervention . Instead of being explicitly programmed for specific tasks , Machine learning algorithms analyze and interpret large datasets to Correlations that can be used for predictions or decision making . These algorithms Continuously improve their accuracy over time as they process more datasets to unconver trends and correlations that can be used for predictions or decision making. These algorithms continuously improve their accuracy over time as they process more data.")
-
-            text_image.close()
+            #texts.append(ocr_from_image(text_image))
+            texts.append(ocr_from_image("output/segmented_lines"))
+            #texts.append("Machine learning is a branch of artificial intelligence that enables computers to learn the data , identify patterns , and make decisions with minimal human intervention . Instead of being explicitly programmed for specific tasks , Machine learning algorithms analyze and interpret large datasets to Correlations that can be used for predictions or decision making . These algorithms Continuously improve their accuracy over time as they process more datasets to unconver trends and correlations that can be used for predictions or decision making. These algorithms continuously improve their accuracy over time as they process more data.")
             
+            text_image.close()  # Close the image to free up resources
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error reading PDF: {str(e)}")
 
-    diagrams = ["output/diagrams/"+f for f in os.listdir("output/diagrams") if f.endswith(".png")]    
-    print(diagrams)
-    print(texts)
-    diagram_similarities = image_similarity(diagram_image, diagrams)
-    shutil.rmtree("output/diagrams")
+    diagrams = ["output/diagrams/"+f for f in os.listdir("output/diagrams") if f.endswith(".png")]   
+    diagram_images = [Image.open(diagram_path) for diagram_path in diagrams] 
+    diagram_similarities = image_similarity(diagram_image, diagram_images)
+
+    text_paths= ["output/texts/"+f for f in os.listdir("output/texts") if f.endswith(".png")]
+    text_paths.sort(key=lambda x: int(x.split('_')[1].split('.')[0]))
+    text_images = [Image.open(text_path) for text_path in text_paths]
     text_similarities = [text_similarity(answer_key.text, text) for text in texts]
 
-    response_data = {
-        i: [float(text_similarities[i]), float(diagram_similarities[i]), texts[i]]
-        for i in range(len(text_similarities))
-    }
 
+    shutil.rmtree("output/diagrams")
+    response_data = {}
+    for i in range(len(text_similarities)):
+        # Encode diagram image
+        buffer_diagram = BytesIO()
+        diagram_images[i].save(buffer_diagram, format="PNG")
+        encoded_image = base64.b64encode(buffer_diagram.getvalue()).decode('utf-8')
+        buffer_diagram.close()
+
+        # Encode text image
+        buffer_text = BytesIO()
+        text_images[i].save(buffer_text, format="PNG")
+        encoded_text_image = base64.b64encode(buffer_text.getvalue()).decode('utf-8')
+        buffer_text.close()
+
+
+        response_data[i] = [
+            float(text_similarities[i]),
+            float(diagram_similarities[i]),
+            texts[i],
+            encoded_image,
+            encoded_text_image,
+        ]
+
+    shutil.rmtree("output/texts")
     return JSONResponse(content=response_data)
 

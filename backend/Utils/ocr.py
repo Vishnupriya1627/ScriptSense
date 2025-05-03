@@ -3,6 +3,8 @@ import numpy as np
 from PIL import Image
 import google.generativeai as genai
 import io
+from google.cloud import vision
+import os
 
 
 def preprocess_image(image):
@@ -22,22 +24,22 @@ def preprocess_image(image):
     return denoised
 
 
-def ocr_from_image(image):
+def test(image):
     """
     Extract text from an image using Tesseract OCR.
     """
-    from google.cloud import vision
+
 
     client = vision.ImageAnnotatorClient()
 
     img_byte_arr = io.BytesIO()
-    image.save(img_byte_arr, format='PNG')  # Ensure format matches your image type
+    image.save(img_byte_arr, format='PNG') 
     content = img_byte_arr.getvalue()
     
     image = vision.Image(content=content)
 
     response = client.document_text_detection(image=image)
-
+    print(response.full_text_annotation.text)
     plain_text = ""
 
     for page in response.full_text_annotation.pages:
@@ -55,4 +57,54 @@ def ocr_from_image(image):
             'https://cloud.google.com/apis/design/errors'.format(
                 response.error.message))
 
+import os
+from google.cloud import vision
+import io
+from PIL import Image
 
+def ocr_from_image(segmented_folder):
+    """
+    Perform OCR on all images in the segmented folder and return the concatenated text in order.
+    """
+    client = vision.ImageAnnotatorClient()
+
+    # Initialize the plain_text variable to store the concatenated OCR results
+    full_text = ""
+
+    # List all files in the segmented folder and sort them to ensure order
+    filenames = [filename for filename in os.listdir(segmented_folder) if filename.endswith(".png")]
+    filenames.sort(key=lambda x: int(x.split('_')[1].split('.')[0]))  # Sort by the number in the filename
+
+    # Process each image in the correct order
+    for filename in filenames:
+        image_path = os.path.join(segmented_folder, filename)
+        image = Image.open(image_path)
+
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format='PNG')
+        content = img_byte_arr.getvalue()
+
+        gcv_image = vision.Image(content=content)
+
+        # Perform text detection using Google Cloud Vision API
+        response = client.document_text_detection(image=gcv_image)
+
+        # Check for errors
+        if response.error.message:
+            raise Exception(
+                '{}\nFor more info on error messages, check: '
+                'https://cloud.google.com/apis/design/errors'.format(response.error.message)
+            )
+
+        # Extract text from the response
+        text = response.full_text_annotation.text
+        full_text += text + " "
+
+    return full_text.strip()
+
+
+if __name__ == "__main__":
+    segmented_folder = "output/segmented_lines"  # Update this to your actual folder path
+    text = ocr_from_image(segmented_folder)
+    print("Extracted Text from all segmented lines:")
+    print(text)

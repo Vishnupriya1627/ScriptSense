@@ -1,6 +1,7 @@
 # Flask (Backend)
 Flask==3.0.0
 Flask-Cors==4.0.0
+uvicorn==0.15.0
 
 # Machine Learning & OCR
 numpy==1.26.0
