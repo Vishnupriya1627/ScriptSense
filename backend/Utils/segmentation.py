@@ -2,7 +2,6 @@ import cv2
 import numpy as np
 import os
 from pdf2image import convert_from_path
-import matplotlib.pyplot as plt
 import shutil
 
 diagram_count = 0
