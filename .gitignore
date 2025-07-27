@@ -1,34 +1,35 @@
-# Logs
-frontend/my-react-app/logs
-frontend/my-react-app/*.log
-frontend/my-react-app/npm-debug.log*
-frontend/my-react-app/yarn-debug.log*
-frontend/my-react-app/yarn-error.log*
-frontend/my-react-app/pnpm-debug.log*
-frontend/my-react-app/lerna-debug.log*
+# Ignore Python cache and compiled files
+__pycache__/
+*.pyc
 
-# Dependencies
-frontend/my-react-app/node_modules
-frontend/my-react-app/dist
-frontend/my-react-app/dist-ssr
-frontend/my-react-app/*.local
+# Ignore virtual environments
+venv/
+.env
+*.env
 
-# Editor directories and files
-frontend/my-react-app/.vscode/*
-!frontend/my-react-app/.vscode/extensions.json
-frontend/my-react-app/.idea
-frontend/my-react-app/.DS_Store
-frontend/my-react-app/*.suo
-frontend/my-react-app/*.ntvs*
-frontend/my-react-app/*.njsproj
-frontend/my-react-app/*.sln
-frontend/my-react-app/*.sw?
-
-backend/Utils/Imag
-backend/analysis
+# Ignore backend-specific files
 backend/peerless-list-436018-s4-bf957558862a.json
-node_modules/
-frontend/my-react-app/node_modules/
+backend/__pycache__/
+backend/Utils/Imag/
+backend/analysis/
+
+# Node.js - Ignore all node_modules
 **/node_modules/
 
-frontend/my-react-app/public/
+# Ignore build artifacts
+dist/
+build/
+
+# Frontend - Ignore default React build folders
+frontend/my-react-app/node_modules/
+frontend/public/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS-specific
+.DS_Store
+Thumbs.db
