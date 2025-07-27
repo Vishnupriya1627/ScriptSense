@@ -107,7 +107,9 @@ def segment_lines_and_find_diagrams(img, output_folder="output", min_height_thre
                                        cv2.THRESH_BINARY_INV, 15, 10)
 
         hist = np.sum(binary, axis=1)
-        threshold = np.max(hist) * 0.2
+        print(hist)
+        threshold = 50000 #np.max(hist) * 0.2
+        print(threshold)
         lines = np.where(hist > threshold)[0]
 
         if len(lines) == 0:
@@ -137,7 +139,7 @@ def segment_lines_and_find_diagrams(img, output_folder="output", min_height_thre
             left_whitespace = np.sum(line_segment[:, :20] == 0) / (20 * line_segment.shape[0])
             right_whitespace = np.sum(line_segment[:, -20:] == 0) / (20 * line_segment.shape[0])
 
-            if left_whitespace > 0.83 and right_whitespace < 0.96:
+            if left_whitespace > 0.90 and right_whitespace < 0.96:
                 filtered_line_segments.append((y_start, y_end))
 
         for idx, (y_start, y_end) in enumerate(filtered_line_segments):

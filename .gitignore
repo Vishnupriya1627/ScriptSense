@@ -24,9 +24,9 @@ frontend/my-react-app/*.njsproj
 frontend/my-react-app/*.sln
 frontend/my-react-app/*.sw?
 
-backend/Utils/Images
-backend/output
-
+backend/Utils/Imag
+backend/analysis
+backend/peerless-list-436018-s4-bf957558862a.json
 node_modules/
 frontend/my-react-app/node_modules/
 **/node_modules/
