@@ -22,22 +22,41 @@ export default function LoginPage(){
 
     return (
         <>
-            <div className="w-screen h-screen flex items-center justify-center bg-white">
-                <div className="flex bg-white h-3/4 w-1/2 rounded-2xl">
-                    <div className="h-full w-1/2 bg-dy-red rounded-l-2xl">
-                        <form onSubmit={handleLogin} className="flex flex-col justify-center items-center h-full text-black">
-                            <h1 className="text-4xl font-bold mb-6 text-white">Login</h1>
-                            <input type="email" placeholder="Username" value={username} onChange={(e) => setUsername(e.target.value)} className="w-3/4 h-10 mb-3 border border-gray-400 rounded-md px-2"/>
-                            <input type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} className="w-3/4 h-10 mb-3 border border-gray-400 rounded-md px-2"/>
-                            <button type="submit" className="w-3/4 h-10 bg-dy-peach font-semibold text-xl text-dy-red rounded-md hover:text-white transition-colors ease-in-out duration-300">Login</button>
-                            {error?<p className='pt-2 text-white'>Invalid credentials</p>:null}
+            <div className="w-screen h-screen flex items-center justify-center" style={{backgroundColor: '#BDE8F5'}}>
+                <div className="flex w-[800px] h-[500px] bg-white shadow-xl">
+                    <div className="w-1/2 flex flex-col justify-center px-12" style={{backgroundColor: '#0F2854'}}>
+                        <h1 className="text-4xl font-light mb-8 text-white" style={{color: '#BDE8F5'}}>welcome back</h1>
+                        <form onSubmit={handleLogin} className="flex flex-col gap-4">
+                            <input 
+                                type="email" 
+                                placeholder="email" 
+                                value={username} 
+                                onChange={(e) => setUsername(e.target.value)} 
+                                className="bg-transparent border-b border-white/30 py-2 text-white placeholder:text-white/50 outline-none focus:border-white transition-colors"
+                            />
+                            <input 
+                                type="password" 
+                                placeholder="password" 
+                                value={password} 
+                                onChange={(e) => setPassword(e.target.value)} 
+                                className="bg-transparent border-b border-white/30 py-2 text-white placeholder:text-white/50 outline-none focus:border-white transition-colors"
+                            />
+                            {error && <p className="text-sm text-white/80">invalid credentials</p>}
+                            <button 
+                                type="submit" 
+                                className="mt-4 py-2 px-6 w-fit text-sm uppercase tracking-wider transition-colors duration-300"
+                                style={{backgroundColor: '#BDE8F5', color: '#0F2854'}}
+                            >
+                                sign in
+                            </button>
                         </form>
-                        
                     </div>
-                    <div className="h-full w-1/2 rounded-r-2xl bg-login flex items-center justify-center">
-                        <h1 className='text-dy-red font-bold text-3xl'> AutoCorrector </h1>
+                    <div className="w-1/2 flex items-center justify-center bg-white">
+                        <div className="text-center">
+                            <h1 className="text-5xl font-light tracking-tight" style={{color: '#0F2854'}}>Auto<span className="font-medium">Corrector</span></h1>
+                            <div className="w-12 h-0.5 mx-auto mt-4" style={{backgroundColor: '#BDE8F5'}}></div>
+                        </div>
                     </div>
-
                 </div>
             </div>
         </>

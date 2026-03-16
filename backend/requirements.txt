@@ -18,3 +18,8 @@ pdf2image===1.17.0
 # Miscellaneous
 requests==2.31.0
 tqdm==4.66.0
+google-generativeai
+google-auth
+sentence-transformers
+google-genai
+google-cloud-vision
