@@ -218,7 +218,7 @@ def visualize_text_region(img, filtered_line_segments, output_path, output_texts
         return False
 
 
-def segment_lines_and_find_diagrams(img, output_folder="output", min_height_threshold=15, padding=5, min_contour_width=1000):
+def segment_lines_and_find_diagrams(img, output_folder="output", min_height_threshold=15, padding=5, min_contour_width=1000, llm=None, sampling_params=None):
     try:
         texts_folder    = os.path.join(output_folder, "texts")
         diagrams_folder = os.path.join(output_folder, "diagrams")
@@ -292,7 +292,7 @@ def segment_lines_and_find_diagrams(img, output_folder="output", min_height_thre
         # ── Step 6: Run Uni-MuMER on formula crops ─────────────────────
         latex_results = {}
         if all_formula_lines:
-            latex_results = run_unimer(formulas_folder, all_formula_lines, formulas_output)
+            latex_results = run_unimer(formulas_folder, all_formula_lines, formulas_output, llm=llm, sampling_params=sampling_params)
             with open(os.path.join(output_folder, "formulas_latex.json"), "w") as f:
                 json.dump(latex_results, f)
             print(f"✅ LaTeX results saved")
