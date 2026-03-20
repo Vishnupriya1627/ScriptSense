@@ -116,12 +116,18 @@ def detect_formula_regions(img_bgr, output_folder):
         return []
 
 
-def run_unimer(formula_crops_dir, all_line_paths, output_dir):
-    """Run Uni-MuMER on detected formula line crops."""
+def run_unimer(formula_crops_dir, all_line_paths, output_dir, llm=None, sampling_params=None):
+    """Run Uni-MuMER - uses preloaded model if available."""
     try:
         if not all_line_paths:
             return {}
 
+        if llm is not None:
+            # Use preloaded model directly
+            from Utils.formula_recognizer import recognize_formulas
+            return recognize_formulas(all_line_paths, llm, sampling_params)
+        
+        # ── Fallback: subprocess ───────────────────────────────────
         prompt = [{
             "images": [os.path.abspath(p)],
             "messages": [
@@ -136,11 +142,8 @@ def run_unimer(formula_crops_dir, all_line_paths, output_dir):
         os.makedirs(formula_crops_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
 
-        prompt_path = os.path.join(formula_crops_dir, "formulas.json")
-        with open(prompt_path, "w") as f:
+        with open(os.path.join(formula_crops_dir, "formulas.json"), "w") as f:
             json.dump(prompt, f)
-
-        print(f"   ➕ Running Uni-MuMER on {len(all_line_paths)} line(s)...")
 
         result = subprocess.run(
             [
@@ -161,13 +164,7 @@ def run_unimer(formula_crops_dir, all_line_paths, output_dir):
             return {}
 
         preds = json.load(open(os.path.join(output_dir, pred_files[0])))
-        latex_map = {}
-        for i, p in enumerate(preds):
-            fname = os.path.basename(all_line_paths[i]) if i < len(all_line_paths) else f"line_{i}"
-            latex_map[fname] = p.get('pred', '')
-            print(f"   ✅ {fname} → {p.get('pred', '')}")
-
-        return latex_map
+        return {os.path.basename(all_line_paths[i]): p.get('pred', '') for i, p in enumerate(preds)}
 
     except Exception as e:
         print(f"[Error] Uni-MuMER failed: {e}")

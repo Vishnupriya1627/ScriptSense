@@ -149,7 +149,7 @@ export default function AnswerSheet() {
         });
 
         try {
-            const response = await axios.post('http://localhost:8080/similarity', formData, {
+            const response = await axios.post('https://mackenzie-unfilterable-kirby.ngrok-free.dev/similarity', formData, {
                 headers: { 'Content-Type': 'multipart/form-data' }
             });
             setResults(response.data);

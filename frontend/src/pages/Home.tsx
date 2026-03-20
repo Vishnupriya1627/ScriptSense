@@ -186,10 +186,12 @@ export default function Home() {
         try {
             console.log("🚀 Sending request to backend...");
             const response = await axios.post(
-                "http://localhost:8080/similarity",
+                "https://mackenzie-unfilterable-kirby.ngrok-free.dev/similarity",
                 formData,
                 { 
-                    headers: { "Content-Type": "multipart/form-data" },
+                    headers: { "Content-Type": "multipart/form-data",
+                            "ngrok-skip-browser-warning": "true"
+                     },
                     onUploadProgress: (progressEvent) => {
                         if (progressEvent.total) {
                             console.log(`📤 Upload progress: ${Math.round((progressEvent.loaded * 100) / progressEvent.total)}%`);
