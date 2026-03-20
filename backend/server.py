@@ -39,12 +39,12 @@ try:
     from vllm import LLM, SamplingParams
     print("🔄 Loading Uni-MuMER model at startup...")
     unimer_llm = LLM(
-        model=UNIMER_MODEL_PATH,
-        trust_remote_code=True,
-        dtype="float16",
-        max_model_len=4096,
-        gpu_memory_utilization=0.6
-    )
+    model=UNIMER_MODEL_PATH,
+    trust_remote_code=True,
+    dtype="float16",
+    max_model_len=2048,
+    gpu_memory_utilization=0.95
+)
     unimer_sampling = SamplingParams(temperature=0, max_tokens=512)
     print("✅ Uni-MuMER loaded and ready!")
 except Exception as e:
