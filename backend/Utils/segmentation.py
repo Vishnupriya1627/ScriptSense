@@ -48,25 +48,27 @@ def is_formula_region(line_img):
         if h == 0 or w == 0:
             return False
 
-        # Too tall and narrow = likely not a formula
-        if w / h < 1.2:  # lowered from 1.5
+        if w / h < 1.2:
             return False
 
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-        row_sums = np.sum(binary, axis=1) > 0
-        ink_spread = np.sum(row_sums) / h
+        row_s = np.sum(binary, axis=1) > 0
+        ink_spread = np.sum(row_s) / h
 
-        col_sums = np.sum(binary, axis=0) > 0
-        transitions = np.diff(col_sums.astype(int))
-        gap_count = np.sum(transitions == -1)
+        col_s = np.sum(binary, axis=0) > 0
+        gaps = np.sum(np.diff(col_s.astype(int)) == -1)
 
-        ink_density = np.sum(binary > 0) / (h * w)
+        density = np.sum(binary > 0) / (h * w)
 
+        # Updated thresholds based on actual data:
+        # ink_spread: 0.86-0.95 → upper limit raised to 1.0
+        # gaps: 4-15 → lower limit kept at 2
+        # density: 0.015-0.040 → lower limit dropped to 0.01
         return (
-            0.2 < ink_spread < 0.95 and  # wider range
-            gap_count >= 2 and            # lowered from 3
-            0.01 < ink_density < 0.5      # wider range
+            0.1 < ink_spread <= 1.0 and
+            gaps >= 2 and
+            0.01 < density < 0.5
         )
     except Exception as e:
         print(f"[Warning] Formula heuristic failed: {e}")
