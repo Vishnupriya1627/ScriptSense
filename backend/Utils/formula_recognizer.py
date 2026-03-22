@@ -1,6 +1,7 @@
 import os
 import sys
 import cv2
+import re
 sys.path.insert(0, '/content/Uni-MuMER')
 
 def resize_for_unimer(image_path, max_pixels=800):
@@ -16,6 +17,17 @@ def resize_for_unimer(image_path, max_pixels=800):
         img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         cv2.imwrite(image_path, img)
     return image_path
+
+def print_unimer_lines(pred):
+    """Print UniMuMER output line by line."""
+    if r'\begin{array}' in pred or r'\begin {array}' in pred:
+        inner = re.sub(r'\\begin\s*\{array\}.*?\}', '', pred)
+        inner = re.sub(r'\\end\s*\{array\}', '', inner)
+        lines = [l.strip() for l in inner.split('\\\\') if l.strip()]
+        for j, line in enumerate(lines):
+            print(f"   Line {j+1}: {line}")
+    else:
+        print(f"   Line 1: {pred}")
 
 def recognize_formulas(line_paths, llm, sampling_params):
     """Run Uni-MuMER recognition using preloaded model."""
@@ -34,7 +46,6 @@ def recognize_formulas(line_paths, llm, sampling_params):
         prompts = []
         valid_paths = []
         for path in line_paths:
-            # Resize image before processing
             resize_for_unimer(path, max_pixels=800)
             
             messages = [{
@@ -63,11 +74,13 @@ def recognize_formulas(line_paths, llm, sampling_params):
         outputs = llm.generate(prompts, sampling_params)
 
         results = {}
+        print("\n   === UniMuMER Recognition Results ===")
         for i, (path, output) in enumerate(zip(valid_paths, outputs)):
             pred = output.outputs[0].text.strip()
             fname = os.path.basename(path)
             results[fname] = pred
-            print(f"   ✅ {fname} → {pred}")
+            print_unimer_lines(pred)
+        print("   =====================================\n")
 
         return results
 
