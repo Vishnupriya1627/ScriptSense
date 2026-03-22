@@ -39,12 +39,12 @@ try:
     from vllm import LLM, SamplingParams
     print("🔄 Loading Uni-MuMER model at startup...")
     unimer_llm = LLM(
-    model=UNIMER_MODEL_PATH,
-    trust_remote_code=True,
-    dtype="float16",
-    max_model_len=2048,
-    gpu_memory_utilization=0.95
-)
+        model=UNIMER_MODEL_PATH,
+        trust_remote_code=True,
+        dtype="float16",
+        max_model_len=4096,
+        gpu_memory_utilization=0.95
+    )
     unimer_sampling = SamplingParams(temperature=0, max_tokens=512)
     print("✅ Uni-MuMER loaded and ready!")
 except Exception as e:
@@ -71,7 +71,6 @@ async def similarity(
         print(f"📨 REQUEST RECEIVED at {time.strftime('%H:%M:%S')}")
         print("="*60)
         
-        # Parse questions
         try:
             questions_data = json.loads(questions)
             print(f"📝 Questions: {len(questions_data)} question(s)")
@@ -79,14 +78,9 @@ async def similarity(
                 print(f"   Q{i+1}: marks={q.get('marks', 0)}, textWeight={q.get('textWeight', 1.0)}, diagramWeight={q.get('diagramWeight', 0.0)}")
         except Exception as e:
             print(f"❌ Failed to parse questions: {e}")
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"Invalid questions format: {str(e)}"}
-            )
+            return JSONResponse(status_code=400, content={"error": f"Invalid questions format: {str(e)}"})
 
-        # Extract all form data
         form = await request.form()
-        
         diagrams = {}
         answer_sheets_list = []
         
@@ -110,10 +104,7 @@ async def similarity(
         print(f"\n📄 Answer sheets to process: {len(answer_sheets_list)}")
         
         if not answer_sheets_list:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No answer sheets provided"}
-            )
+            return JSONResponse(status_code=400, content={"error": "No answer sheets provided"})
 
         all_results = []
         
@@ -124,10 +115,6 @@ async def similarity(
                 sheet_content = await sheet.read()
                 print(f"   📦 Read {len(sheet_content)} bytes")
                 
-                if len(sheet_content) < 1000:
-                    print(f"   ⚠️ Sheet may be too small: {len(sheet_content)} bytes")
-                
-                # Convert PDF to images
                 try:
                     images = convert_from_bytes(sheet_content)
                     print(f"   ✅ Converted to {len(images)} page(s)")
@@ -147,8 +134,6 @@ async def similarity(
                     try:
                         image = image.convert("RGB")
                         image_array = np.array(image)
-                        
-                        # Run segmentation with preloaded Uni-MuMER
                         text_count, diagram_count = segment_lines_and_find_diagrams(
                             image_array,
                             output_folder=sheet_output_dir,
@@ -158,7 +143,7 @@ async def similarity(
                             llm=unimer_llm,
                             sampling_params=unimer_sampling
                         )
-                        print(f"   📄 Page {page_idx+1}: {text_count} text lines, {diagram_count} diagrams")
+                        print(f"   📄 Page {page_idx+1}: {text_count} lines, {diagram_count} diagrams")
                     except Exception as e:
                         print(f"   ⚠️ Segmentation error on page {page_idx+1}: {e}")
                 
@@ -182,25 +167,22 @@ async def similarity(
                     try:
                         latex_data = json.load(open(latex_file))
                         all_formulas = [v for v in latex_data.values() if v]
-                        print(f"   ➕ Formulas detected: {all_formulas}")
+                        print(f"   ➕ UniMuMER formulas: {len(all_formulas)} line(s)")
                     except Exception as e:
                         print(f"   ⚠️ Formula read error: {e}")
                 else:
-                    print(f"   ℹ️ No formulas detected in this sheet")
+                    print(f"   ℹ️ No UniMuMER results")
 
                 # ===== GET DIAGRAMS =====
                 if os.path.exists(f"{sheet_output_dir}/diagrams"):
-                    diagram_paths = [
-                        os.path.join(f"{sheet_output_dir}/diagrams", f)
-                        for f in os.listdir(f"{sheet_output_dir}/diagrams") if f.endswith(".png")
-                    ]
-                    for diagram_path in diagram_paths:
-                        try:
-                            all_diagrams.append(Image.open(diagram_path))
-                        except Exception as e:
-                            print(f"   ⚠️ Diagram load error: {e}")
+                    for f in os.listdir(f"{sheet_output_dir}/diagrams"):
+                        if f.endswith(".png"):
+                            try:
+                                all_diagrams.append(Image.open(os.path.join(f"{sheet_output_dir}/diagrams", f)))
+                            except Exception as e:
+                                print(f"   ⚠️ Diagram load error: {e}")
 
-                print(f"   📊 Extracted {len(all_texts)} text blocks, {len(all_diagrams)} diagrams, {len(all_formulas)} formula(s)")
+                print(f"   📊 OCR: {len(all_texts)} block(s), UniMuMER: {len(all_formulas)} line(s), Diagrams: {len(all_diagrams)}")
 
                 total_obtained = 0
                 total_possible = 0
@@ -209,41 +191,49 @@ async def similarity(
                 for q_idx, q_data in enumerate(questions_data):
                     print(f"\n   [{time.time()-start_time:.1f}s] 🔍 Question {q_idx + 1}...")
                     
-                    # ===== TEXT + FORMULA SIMILARITY =====
+                    # ===== BEST OF OCR + UNI-MUMER =====
                     text_sim = 0.0
                     if q_data.get('keyAnswer'):
                         try:
-                            similarities = []
+                            all_candidates = []
 
-                            for t in all_texts[:3]:
-                                sim = text_similarity(q_data['keyAnswer'], t)
-                                similarities.append(sim)
+                            # Add OCR results
+                            for t in all_texts:
+                                all_candidates.append(('OCR', t))
 
+                            # Add UniMuMER LaTeX results
                             for f in all_formulas:
-                                sim = text_similarity(q_data['keyAnswer'], f)
-                                similarities.append(sim)
+                                all_candidates.append(('UniMuMER', f))
 
+                            # Add joined UniMuMER result
                             if all_formulas:
                                 joined = " ".join(all_formulas)
-                                sim = text_similarity(q_data['keyAnswer'], joined)
-                                similarities.append(sim)
-                                print(f"      ➕ Joined formula similarity: {sim:.3f}")
+                                all_candidates.append(('UniMuMER-joined', joined))
 
-                            text_sim = max(similarities) if similarities else 0.0
-                            print(f"      📝 Best text/formula similarity: {text_sim:.3f} (from {len(similarities)} comparisons)")
+                            # Score all candidates
+                            scored = []
+                            for source, text in all_candidates:
+                                sim = text_similarity(q_data['keyAnswer'], text)
+                                scored.append((sim, source, text))
+                                print(f"      [{source}] {text[:40]}... → {sim:.3f}")
+
+                            if scored:
+                                scored.sort(reverse=True)
+                                text_sim = scored[0][0]
+                                best_source = scored[0][1]
+                                best_text = scored[0][2]
+                                print(f"      🏆 Best: [{best_source}] {best_text[:50]} → {text_sim:.3f}")
+
                         except Exception as e:
-                            print(f"      ⚠️ Text similarity error: {e}")
+                            print(f"      ⚠️ Similarity error: {e}")
                     
                     # ===== DIAGRAM SIMILARITY =====
                     diagram_sim = 0.0
                     if all_diagrams and q_idx in diagrams:
                         try:
                             key_diagram = diagrams[q_idx]
-                            similarities = []
-                            for student_diagram in all_diagrams:
-                                sim = image_similarity(key_diagram, [student_diagram])[0]
-                                similarities.append(sim)
-                            diagram_sim = max(similarities) if similarities else 0.0
+                            sims = [image_similarity(key_diagram, [d])[0] for d in all_diagrams]
+                            diagram_sim = max(sims) if sims else 0.0
                             print(f"      🖼️ Best diagram similarity: {diagram_sim:.3f}")
                         except Exception as e:
                             print(f"      ⚠️ Diagram similarity error: {e}")
@@ -252,23 +242,20 @@ async def similarity(
                     text_weight = q_data.get('textWeight', 1.0)
                     diagram_weight = q_data.get('diagramWeight', 0.0)
                     
-                    print(f"      ⚖️ Requested weights - Text: {text_weight:.1f}, Diagram: {diagram_weight:.1f}")
-                    
                     if q_idx not in diagrams:
                         diagram_weight = 0.0
                         text_weight = 1.0
-                        print(f"      📝 No diagram key provided - using text only")
+                        print(f"      📝 No diagram key - text only")
                     elif len(all_diagrams) == 0:
                         diagram_weight = 0.0
                         text_weight = 1.0
-                        print(f"      📝 No diagram in student answer - using text only")
+                        print(f"      📝 No student diagram - text only")
                     else:
                         total_weight = text_weight + diagram_weight
                         if abs(total_weight - 1.0) > 0.01 and total_weight > 0:
                             text_weight = text_weight / total_weight
                             diagram_weight = diagram_weight / total_weight
-                            print(f"      ⚖️ Normalized weights - Text: {text_weight:.2f}, Diagram: {diagram_weight:.2f}")
-                    
+
                     weighted_similarity = (text_sim * text_weight) + (diagram_sim * diagram_weight)
                     obtained = weighted_similarity * marks
                     
@@ -295,14 +282,12 @@ async def similarity(
                     pass
                 
                 percentage = round((total_obtained / total_possible * 100) if total_possible > 0 else 0, 1)
-                
                 sheet_result = {
                     "totalObtained": round(total_obtained, 2),
                     "totalPossible": total_possible,
                     "percentage": percentage,
                     "breakdown": breakdown
                 }
-                
                 all_results.append(sheet_result)
                 print(f"\n   [{time.time()-start_time:.1f}s] ✅ Sheet {sheet_idx+1}: {sheet_result['totalObtained']}/{sheet_result['totalPossible']} ({sheet_result['percentage']}%)")
                 
@@ -329,12 +314,7 @@ async def similarity(
         else:
             return JSONResponse(
                 status_code=500,
-                content={
-                    "totalObtained": 0,
-                    "totalPossible": 0,
-                    "percentage": 0,
-                    "breakdown": []
-                }
+                content={"totalObtained": 0, "totalPossible": 0, "percentage": 0, "breakdown": []}
             )
             
     except Exception as e:
@@ -342,11 +322,5 @@ async def similarity(
         traceback.print_exc()
         return JSONResponse(
             status_code=500,
-            content={
-                "totalObtained": 0,
-                "totalPossible": 0,
-                "percentage": 0,
-                "breakdown": [],
-                "error": f"Server error: {str(e)}"
-            }
+            content={"totalObtained": 0, "totalPossible": 0, "percentage": 0, "breakdown": [], "error": f"Server error: {str(e)}"}
         )

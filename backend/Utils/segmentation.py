@@ -236,68 +236,78 @@ def segment_lines_and_find_diagrams(img, output_folder="output", min_height_thre
         img = correct_tilt(img)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape)==3 else img
 
-        # ── Step 1: Detect formula regions with YOLO ──────────────────
-        all_formula_lines = detect_formula_regions(img, formulas_folder)
-
-        # ── Step 2: Get formula bounding boxes to exclude from text ───
-        formula_row_mask = np.zeros(img.shape[0], dtype=bool)
-        for line_path in all_formula_lines:
-            # Mark rows covered by formula regions as formula rows
-            pass  # handled by YOLO bbox exclusion below
-
-        # ── Step 3: Text line detection (contour based) ────────────────
+        # ── Horizontal projection line detection ──────────────────────
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        kernel = np.ones((3, 10), np.uint8)
-        dilated = cv2.dilate(binary, kernel, iterations=2)
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        row_sums = np.sum(binary, axis=1)
+        row_sums_smooth = np.convolve(row_sums, np.ones(5)/5, mode='same')
+        threshold = np.max(row_sums_smooth) * 0.01
+        has_ink = row_sums_smooth > threshold
 
-        text_contours = []
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            if h > min_height_threshold and w > 30 and h < 150 and w/h < 20:
-                text_contours.append((x, y, w, h))
-        text_contours.sort(key=lambda r: r[1])
+        lines, in_line, start = [], False, 0
+        for i, ink in enumerate(has_ink):
+            if ink and not in_line:
+                start = i
+                in_line = True
+            elif not ink and in_line:
+                in_line = False
+                y1 = max(0, start - padding)
+                y2 = min(img.shape[0], i + padding)
+                if y2 - y1 > min_height_threshold:
+                    lines.append((y1, y2))
+        if in_line:
+            lines.append((max(0, start - padding), img.shape[0]))
 
-        merged_contours = []
-        for contour in text_contours:
-            if not merged_contours:
-                merged_contours.append(list(contour))
-                continue
-            last = merged_contours[-1]
-            x, y, w, h = contour
-            y_overlap = max(0, min(last[1]+last[3], y+h) - max(last[1], y))
-            if y_overlap > 0:
-                last[0] = min(last[0], x)
-                last[1] = min(last[1], y)
-                last[2] = max(last[0]+last[2], x+w) - last[0]
-                last[3] = max(last[1]+last[3], y+h) - last[1]
+        # Merge overlapping lines
+        merged_lines = []
+        for y1, y2 in lines:
+            if merged_lines and (y1 - merged_lines[-1][1]) < 2:
+                merged_lines[-1] = (merged_lines[-1][0], y2)
             else:
-                merged_contours.append(list(contour))
+                merged_lines.append((y1, y2))
 
-        print(f"✅ Detected {len(merged_contours)} text line(s)")
+        print(f"✅ Detected {len(merged_lines)} line(s)")
 
-        # ── Step 4: Save text lines (skip formula rows) ────────────────
-        text_line_segments = []
-        for idx, (x, y, w, h) in enumerate(merged_contours):
-            x1 = max(0, x-padding); y1 = max(0, y-padding)
-            x2 = min(img.shape[1], x+w+padding); y2 = min(img.shape[0], y+h+padding)
-            cv2.imwrite(f"{segmented_folder}/line_{idx+1}.png", img[y1:y2, x1:x2])
-            text_line_segments.append((y, y+h))
+        # ── Save all lines as both text and formula crops ──────────────
+        all_line_paths = []
+        for idx, (y1, y2) in enumerate(merged_lines):
+            crop = img[y1:y2, :]
+            # Trim horizontal whitespace
+            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            _, bin_crop = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            col_sums = np.sum(bin_crop, axis=0)
+            nonzero = np.where(col_sums > 0)[0]
+            if len(nonzero) > 0:
+                x1 = max(0, nonzero[0] - 10)
+                x2 = min(crop.shape[1], nonzero[-1] + 10)
+                crop = crop[:, x1:x2]
 
-        # ── Step 5: Text region extraction ────────────────────────────
-        text_bounding_box_path = os.path.join(output_folder, "text_bounding_box.png")
-        visualize_text_region(img, text_line_segments, text_bounding_box_path, texts_folder)
-        diagram_count = extract_diagram(text_bounding_box_path, diagrams_folder)
+            line_path = os.path.join(segmented_folder, f"line_{idx:03d}.png")
+            cv2.imwrite(line_path, crop)
 
-        # ── Step 6: Run Uni-MuMER on formula crops ─────────────────────
+            # Save to both folders
+            cv2.imwrite(os.path.join(texts_folder, f"text_{idx:03d}.png"), crop)
+            cv2.imwrite(os.path.join(formulas_folder, f"formula_{idx:03d}.png"), crop)
+            all_line_paths.append(line_path)
+
+        print(f"✅ Saved {len(all_line_paths)} line crops")
+
+        # ── Run Uni-MuMER on ALL lines ─────────────────────────────────
         latex_results = {}
-        if all_formula_lines:
-            latex_results = run_unimer(formulas_folder, all_formula_lines, formulas_output, llm=llm, sampling_params=sampling_params)
+        if llm is not None and all_line_paths:
+            latex_results = run_unimer(
+                formulas_folder, all_line_paths, formulas_output,
+                llm=llm, sampling_params=sampling_params
+            )
             with open(os.path.join(output_folder, "formulas_latex.json"), "w") as f:
                 json.dump(latex_results, f)
-            print(f"✅ LaTeX results saved")
+            print(f"✅ Uni-MuMER results saved: {len(latex_results)} lines")
 
-        return len(merged_contours), diagram_count if diagram_count else 0
+        # ── Diagram extraction (from full image minus text rows) ───────
+        text_bounding_box_path = os.path.join(output_folder, "text_bounding_box.png")
+        visualize_text_region(img, merged_lines, text_bounding_box_path, texts_folder)
+        diagram_count = extract_diagram(text_bounding_box_path, diagrams_folder)
+
+        return len(merged_lines), diagram_count if diagram_count else 0
 
     except Exception as e:
         print(f"[Error] Segmentation failed: {e}")
