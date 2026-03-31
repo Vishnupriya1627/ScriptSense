@@ -11,6 +11,7 @@ from Utils.image_similarity import image_similarity
 import numpy as np
 import os
 import sys
+import re
 import shutil
 import json
 import traceback
@@ -19,6 +20,9 @@ import time
 
 app = FastAPI()
 
+from evaluation import router as eval_router
+app.include_router(eval_router)
+
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
@@ -26,6 +30,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 # ── Load Uni-MuMER at startup ──────────────────────────────────
@@ -51,6 +57,37 @@ except Exception as e:
     print(f"⚠️ Uni-MuMER failed to load: {e}")
     unimer_llm = None
 # ───────────────────────────────────────────────────────────────
+
+
+# ── Uni-MuMER output cleaner ───────────────────────────────────
+def clean_unimumer_output(text):
+    """
+    Fixes spaced-out characters from Uni-MuMER text output.
+    'G r a d i e n t   d e s c e n t' → 'Gradient descent'
+    Math lines like 'P \\times \\frac { 81 } { 512 }' are left untouched.
+    """
+    # If it contains LaTeX math symbols, keep as-is
+    if any(c in text for c in ['\\', '{', '}', '^', '_']):
+        return text
+
+    # Pure text — merge single spaced-out characters into words
+    tokens = text.split(' ')
+    result = []
+    i = 0
+    while i < len(tokens):
+        # If current token is a single letter, start merging
+        if len(tokens[i]) == 1 and tokens[i].isalpha():
+            word = tokens[i]
+            while i + 1 < len(tokens) and len(tokens[i + 1]) == 1 and tokens[i + 1].isalpha():
+                word += tokens[i + 1]
+                i += 1
+            result.append(word)
+        else:
+            result.append(tokens[i])
+        i += 1
+    return ' '.join(result)
+# ───────────────────────────────────────────────────────────────
+
 
 @app.get("/health")
 async def health_check():
@@ -147,7 +184,7 @@ async def similarity(
                     except Exception as e:
                         print(f"   ⚠️ Segmentation error on page {page_idx+1}: {e}")
                 
-                # ===== OCR FOR TEXT =====
+                # ===== OCR (kept for fallback, not used in scoring) =====
                 if os.path.exists(f"{sheet_output_dir}/texts"):
                     text_files = sorted([f for f in os.listdir(f"{sheet_output_dir}/texts") if f.endswith('.png')])
                     for text_file in text_files:
@@ -160,14 +197,17 @@ async def similarity(
                         except Exception as e:
                             print(f"   ⚠️ OCR error: {e}")
 
-                # ===== READ FORMULA LATEX RESULTS =====
+                # ===== READ UNI-MUMER RESULTS =====
                 all_formulas = []
                 latex_file = f"{sheet_output_dir}/formulas_latex.json"
                 if os.path.exists(latex_file):
                     try:
                         latex_data = json.load(open(latex_file))
-                        all_formulas = [v for v in latex_data.values() if v]
-                        print(f"   ➕ UniMuMER formulas: {len(all_formulas)} line(s)")
+                        # Clean spaced-out characters from Uni-MuMER output
+                        all_formulas = [clean_unimumer_output(v) for v in latex_data.values() if v]
+                        print(f"   ➕ UniMuMER lines: {len(all_formulas)}")
+                        for i, line in enumerate(all_formulas):
+                            print(f"      Line {i+1}: {line}")
                     except Exception as e:
                         print(f"   ⚠️ Formula read error: {e}")
                 else:
@@ -182,7 +222,7 @@ async def similarity(
                             except Exception as e:
                                 print(f"   ⚠️ Diagram load error: {e}")
 
-                print(f"   📊 OCR: {len(all_texts)} block(s), UniMuMER: {len(all_formulas)} line(s), Diagrams: {len(all_diagrams)}")
+                print(f"   📊 UniMuMER: {len(all_formulas)} line(s), Diagrams: {len(all_diagrams)}")
 
                 total_obtained = 0
                 total_possible = 0
@@ -191,21 +231,17 @@ async def similarity(
                 for q_idx, q_data in enumerate(questions_data):
                     print(f"\n   [{time.time()-start_time:.1f}s] 🔍 Question {q_idx + 1}...")
                     
-                    # ===== BEST OF OCR + UNI-MUMER =====
+                    # ===== UNI-MUMER ONLY FOR SCORING =====
                     text_sim = 0.0
                     if q_data.get('keyAnswer'):
                         try:
                             all_candidates = []
 
-                            # Add OCR results
-                            for t in all_texts:
-                                all_candidates.append(('OCR', t))
-
-                            # Add UniMuMER LaTeX results
+                            # Uni-MuMER individual lines
                             for f in all_formulas:
                                 all_candidates.append(('UniMuMER', f))
 
-                            # Add joined UniMuMER result
+                            # Uni-MuMER all lines joined as one block
                             if all_formulas:
                                 joined = " ".join(all_formulas)
                                 all_candidates.append(('UniMuMER-joined', joined))
@@ -215,14 +251,14 @@ async def similarity(
                             for source, text in all_candidates:
                                 sim = text_similarity(q_data['keyAnswer'], text)
                                 scored.append((sim, source, text))
-                                print(f"      [{source}] {text[:40]}... → {sim:.3f}")
+                                print(f"      [{source}] {text[:60]} → {sim:.3f}")
 
                             if scored:
                                 scored.sort(reverse=True)
                                 text_sim = scored[0][0]
                                 best_source = scored[0][1]
                                 best_text = scored[0][2]
-                                print(f"      🏆 Best: [{best_source}] {best_text[:50]} → {text_sim:.3f}")
+                                print(f"      🏆 Best: [{best_source}] {best_text[:60]} → {text_sim:.3f}")
 
                         except Exception as e:
                             print(f"      ⚠️ Similarity error: {e}")

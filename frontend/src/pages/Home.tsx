@@ -186,11 +186,12 @@ export default function Home() {
         try {
             console.log("🚀 Sending request to backend...");
             const response = await axios.post(
-                "https://mackenzie-unfilterable-kirby.ngrok-free.dev/similarity",
+                "https://rocky-wrist-harbour-tall.trycloudflare.com/similarity",
                 formData,
                 { 
                     headers: { "Content-Type": "multipart/form-data",
-                            "ngrok-skip-browser-warning": "true"
+                                "cf-access-bypass": "true"
+                            //"ngrok-skip-browser-warning": "true"
                      },
                     onUploadProgress: (progressEvent) => {
                         if (progressEvent.total) {
