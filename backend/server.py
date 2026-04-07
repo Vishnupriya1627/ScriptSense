@@ -59,23 +59,21 @@ except Exception as e:
 # ───────────────────────────────────────────────────────────────
 
 
-# ── Uni-MuMER output cleaner ───────────────────────────────────
+# ── Simple character-level cleaner (fallback only) ────────────
 def clean_unimumer_output(text):
     """
     Fixes spaced-out characters from Uni-MuMER text output.
     'G r a d i e n t   d e s c e n t' → 'Gradient descent'
     Math lines like 'P \\times \\frac { 81 } { 512 }' are left untouched.
+    Used as fallback when Qwen is unavailable.
     """
-    # If it contains LaTeX math symbols, keep as-is
     if any(c in text for c in ['\\', '{', '}', '^', '_']):
         return text
 
-    # Pure text — merge single spaced-out characters into words
     tokens = text.split(' ')
     result = []
     i = 0
     while i < len(tokens):
-        # If current token is a single letter, start merging
         if len(tokens[i]) == 1 and tokens[i].isalpha():
             word = tokens[i]
             while i + 1 < len(tokens) and len(tokens[i + 1]) == 1 and tokens[i + 1].isalpha():
@@ -86,6 +84,65 @@ def clean_unimumer_output(text):
             result.append(tokens[i])
         i += 1
     return ' '.join(result)
+# ───────────────────────────────────────────────────────────────
+
+
+# ── Qwen restructuring via vLLM (already in GPU memory) ───────
+def restructure_with_qwen(raw_lines: list, ocr_line_count: int) -> list:
+    """
+    Sends Uni-MuMER raw output to Qwen (already loaded in vLLM memory) to
+    restructure into clean, readable lines.
+
+    - ocr_line_count: how many lines OCR detected — used to guide Qwen on
+      how many output lines to produce, so the result mirrors the answer sheet.
+    - Falls back to clean_unimumer_output() if model is unavailable.
+    """
+    if not unimer_llm:
+        print("   ⚠️ Qwen/vLLM not available — falling back to simple cleaner")
+        return [clean_unimumer_output(line) for line in raw_lines]
+
+    if not raw_lines:
+        return []
+
+    raw_text = "\n".join(raw_lines)
+
+    prompt = f"""You are a handwritten answer sheet transcription assistant.
+Below is raw OCR output from a student's answer sheet. It may have:
+- Spaced out characters like 'G r a d i e n t' that should be 'Gradient'
+- LaTeX math like '\\frac{{81}}{{512}}' that must be kept exactly as-is
+- Mixed text and math on the same line
+
+Raw output:
+{raw_text}
+
+The original answer sheet has approximately {ocr_line_count} lines.
+
+Restructure this into exactly {ocr_line_count} clean, readable lines.
+Rules:
+1. Merge spaced-out letters into proper words
+2. Keep all LaTeX math symbols exactly as they are (\\frac, \\times, ^, _, etc.)
+3. Do not add or remove any mathematical content
+4. Output ONLY the restructured lines, one per line, no explanations
+
+Restructured output:"""
+
+    try:
+        from vllm import SamplingParams
+        restructure_sampling = SamplingParams(temperature=0, max_tokens=1024)
+        outputs = unimer_llm.generate([prompt], restructure_sampling)
+        result = outputs[0].outputs[0].text.strip()
+
+        lines = [l.strip() for l in result.split('\n') if l.strip()]
+
+        if not lines:
+            print("   ⚠️ Qwen returned empty output — falling back to simple cleaner")
+            return [clean_unimumer_output(line) for line in raw_lines]
+
+        return lines
+
+    except Exception as e:
+        print(f"   ⚠️ Qwen restructure error: {e} — falling back to simple cleaner")
+        return [clean_unimumer_output(line) for line in raw_lines]
 # ───────────────────────────────────────────────────────────────
 
 
@@ -184,7 +241,7 @@ async def similarity(
                     except Exception as e:
                         print(f"   ⚠️ Segmentation error on page {page_idx+1}: {e}")
                 
-                # ===== OCR (kept for fallback, not used in scoring) =====
+                # ===== OCR — run to get line count for Qwen guidance =====
                 if os.path.exists(f"{sheet_output_dir}/texts"):
                     text_files = sorted([f for f in os.listdir(f"{sheet_output_dir}/texts") if f.endswith('.png')])
                     for text_file in text_files:
@@ -197,21 +254,33 @@ async def similarity(
                         except Exception as e:
                             print(f"   ⚠️ OCR error: {e}")
 
-                # ===== READ UNI-MUMER RESULTS =====
+                # ===== READ UNI-MUMER RESULTS & RESTRUCTURE WITH QWEN =====
                 all_formulas = []
                 latex_file = f"{sheet_output_dir}/formulas_latex.json"
                 if os.path.exists(latex_file):
                     try:
                         latex_data = json.load(open(latex_file))
-                        # Clean spaced-out characters from Uni-MuMER output
-                        all_formulas = [clean_unimumer_output(v) for v in latex_data.values() if v]
-                        print(f"   ➕ UniMuMER lines: {len(all_formulas)}")
+
+                        # Raw lines from Uni-MuMER
+                        raw_formulas = [v for v in latex_data.values() if v]
+
+                        # OCR line count guides how many clean lines Qwen produces
+                        # Falls back to raw formula count if OCR found nothing
+                        ocr_line_count = len(all_texts) if all_texts else len(raw_formulas)
+
+                        print(f"   🔄 Restructuring {len(raw_formulas)} Uni-MuMER line(s) using Qwen "
+                              f"(OCR line count: {ocr_line_count})...")
+
+                        all_formulas = restructure_with_qwen(raw_formulas, ocr_line_count)
+
+                        print(f"   ✅ UniMuMER lines after Qwen restructure: {len(all_formulas)}")
                         for i, line in enumerate(all_formulas):
                             print(f"      Line {i+1}: {line}")
+
                     except Exception as e:
-                        print(f"   ⚠️ Formula read error: {e}")
+                        print(f"   ⚠️ Formula read/restructure error: {e}")
                 else:
-                    print(f"   ℹ️ No UniMuMER results")
+                    print(f"   ℹ️ No UniMuMER results found")
 
                 # ===== GET DIAGRAMS =====
                 if os.path.exists(f"{sheet_output_dir}/diagrams"):
@@ -222,7 +291,7 @@ async def similarity(
                             except Exception as e:
                                 print(f"   ⚠️ Diagram load error: {e}")
 
-                print(f"   📊 UniMuMER: {len(all_formulas)} line(s), Diagrams: {len(all_diagrams)}")
+                print(f"   📊 Restructured lines: {len(all_formulas)}, Diagrams: {len(all_diagrams)}")
 
                 total_obtained = 0
                 total_possible = 0
@@ -231,22 +300,21 @@ async def similarity(
                 for q_idx, q_data in enumerate(questions_data):
                     print(f"\n   [{time.time()-start_time:.1f}s] 🔍 Question {q_idx + 1}...")
                     
-                    # ===== UNI-MUMER ONLY FOR SCORING =====
+                    # ===== SCORING: Qwen-restructured Uni-MuMER output =====
                     text_sim = 0.0
                     if q_data.get('keyAnswer'):
                         try:
                             all_candidates = []
 
-                            # Uni-MuMER individual lines
+                            # Each individual restructured line as a candidate
                             for f in all_formulas:
-                                all_candidates.append(('UniMuMER', f))
+                                all_candidates.append(('UniMuMER-Qwen', f))
 
-                            # Uni-MuMER all lines joined as one block
+                            # All lines joined as one block candidate
                             if all_formulas:
                                 joined = " ".join(all_formulas)
-                                all_candidates.append(('UniMuMER-joined', joined))
+                                all_candidates.append(('UniMuMER-Qwen-joined', joined))
 
-                            # Score all candidates
                             scored = []
                             for source, text in all_candidates:
                                 sim = text_similarity(q_data['keyAnswer'], text)
@@ -325,7 +393,9 @@ async def similarity(
                     "breakdown": breakdown
                 }
                 all_results.append(sheet_result)
-                print(f"\n   [{time.time()-start_time:.1f}s] ✅ Sheet {sheet_idx+1}: {sheet_result['totalObtained']}/{sheet_result['totalPossible']} ({sheet_result['percentage']}%)")
+                print(f"\n   [{time.time()-start_time:.1f}s] ✅ Sheet {sheet_idx+1}: "
+                      f"{sheet_result['totalObtained']}/{sheet_result['totalPossible']} "
+                      f"({sheet_result['percentage']}%)")
                 
             except Exception as e:
                 print(f"❌ Error processing sheet {sheet_idx+1}: {e}")
