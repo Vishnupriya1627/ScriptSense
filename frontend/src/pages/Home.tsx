@@ -186,7 +186,7 @@ export default function Home() {
         try {
             console.log("🚀 Sending request to backend...");
             const response = await axios.post(
-                "https://rocky-wrist-harbour-tall.trycloudflare.com/similarity",
+                " https://mackenzie-unfilterable-kirby.ngrok-free.dev/similarity",
                 formData,
                 { 
                     headers: { "Content-Type": "multipart/form-data",
