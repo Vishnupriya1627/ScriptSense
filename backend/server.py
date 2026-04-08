@@ -7,22 +7,16 @@ from pdf2image import convert_from_bytes
 from Utils.segmentation import segment_lines_and_find_diagrams
 from Utils.ocr import ocr_from_image
 from Utils.similarity import text_similarity
-from Utils.image_similarity import image_similarity
 import numpy as np
-import os
-import sys
-import shutil
-import json
-import traceback
+import os, sys, shutil, json, traceback, time
 from typing import List
-import time
+import torch, gc
 
 app = FastAPI()
 
-from evaluation import router as eval_router
-app.include_router(eval_router)
-
-# CORS
+# =========================
+# 🔹 CORS
+# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,47 +26,49 @@ app.add_middleware(
 )
 
 # =========================
-# 🔹 LOAD MODELS
+# 🔹 PATH SETUP
 # =========================
 sys.path.insert(0, '/content/Uni-MuMER')
 
 from vllm import LLM, SamplingParams
 
-# ---- Uni-MuMER ----
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
-unimer_llm = None
-unimer_sampling = SamplingParams(temperature=0, max_tokens=512)
+QWEN_MODEL_PATH = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
 
-try:
+# =========================
+# 🔹 GPU CLEANER
+# =========================
+def clear_gpu():
+    torch.cuda.empty_cache()
+    gc.collect()
+
+# =========================
+# 🔹 LOADERS (SEQUENTIAL)
+# =========================
+def load_unimer():
     print("🔄 Loading Uni-MuMER...")
-    unimer_llm = LLM(
+    llm = LLM(
         model=UNIMER_MODEL_PATH,
         trust_remote_code=True,
         dtype="float16",
-        gpu_memory_utilization=0.85
+        gpu_memory_utilization=0.80
     )
     print("✅ Uni-MuMER loaded")
-except Exception as e:
-    print(f"❌ Uni-MuMER failed: {e}")
+    return llm, SamplingParams(temperature=0, max_tokens=512)
 
-# ---- QWEN (LLM) ----
-QWEN_MODEL_PATH = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
-qwen_llm = None
-
-try:
+def load_qwen():
     print("🔄 Loading Qwen...")
-    qwen_llm = LLM(
+    llm = LLM(
         model=QWEN_MODEL_PATH,
         trust_remote_code=True,
         dtype="float16",
-        gpu_memory_utilization=0.75
+        gpu_memory_utilization=0.70
     )
     print("✅ Qwen loaded")
-except Exception as e:
-    print(f"❌ Qwen failed: {e}")
+    return llm
 
 # =========================
-# 🔹 CLEANER (fallback)
+# 🔹 CLEANER (same)
 # =========================
 def clean_unimumer_output(text):
     if any(c in text for c in ['\\', '{', '}', '^', '_']):
@@ -94,17 +90,21 @@ def clean_unimumer_output(text):
     return ' '.join(result)
 
 # =========================
-# 🔹 QWEN RESTRUCTURE
+# 🔹 QWEN RESTRUCTURE (UPDATED)
 # =========================
-def restructure_with_qwen(raw_lines: list, ocr_line_count: int) -> list:
+def restructure_with_qwen(raw_lines: list, ocr_line_count: int):
 
-    if not qwen_llm:
-        print("⚠️ Qwen not available — fallback")
-        return [clean_unimumer_output(l) for l in raw_lines]
+    if not raw_lines:
+        return []
 
-    raw_text = "\n".join(raw_lines)
+    qwen_llm = None
 
-    prompt = f"""You are an expert at reconstructing handwritten answer sheets.
+    try:
+        qwen_llm = load_qwen()
+
+        raw_text = "\n".join(raw_lines)
+
+        prompt = f"""You are an expert at reconstructing handwritten answer sheets.
 
 You MUST output EXACTLY {ocr_line_count} lines.
 
@@ -113,7 +113,6 @@ Rules:
 - Keep ALL LaTeX exactly as-is
 - Do NOT change meaning
 - Do NOT explain anything
-- Do NOT add numbering
 - Output ONLY clean lines
 
 Raw OCR:
@@ -121,14 +120,13 @@ Raw OCR:
 
 Final Answer ({ocr_line_count} lines):"""
 
-    try:
         sampling = SamplingParams(temperature=0, max_tokens=1024)
         outputs = qwen_llm.generate([prompt], sampling)
         result = outputs[0].outputs[0].text.strip()
 
         lines = [l.strip() for l in result.split("\n") if l.strip()]
 
-        # 🔥 FORCE EXACT LINE COUNT
+        # enforce line count
         if len(lines) > ocr_line_count:
             lines = lines[:ocr_line_count]
         elif len(lines) < ocr_line_count:
@@ -141,8 +139,24 @@ Final Answer ({ocr_line_count} lines):"""
         print(f"⚠️ Qwen error: {e}")
         return [clean_unimumer_output(l) for l in raw_lines]
 
+    finally:
+        # 🔥 ALWAYS FREE GPU
+        if qwen_llm:
+            del qwen_llm
+        clear_gpu()
+
 # =========================
-# 🔹 API
+# 🔹 HEALTH CHECK
+# =========================
+@app.get("/health")
+async def health():
+    return {
+        "status": "running",
+        "mode": "sequential-loading"
+    }
+
+# =========================
+# 🔹 MAIN API (UPDATED)
 # =========================
 @app.post("/similarity")
 async def similarity(
@@ -151,24 +165,23 @@ async def similarity(
     answer_sheets: List[UploadFile] = File(...)
 ):
     try:
-        start_time = time.time()
+        print("\n🚀 New request received")
+
         questions_data = json.loads(questions)
+        sheets = answer_sheets if answer_sheets else []
 
-        form = await request.form()
-        diagrams = {}
-        sheets = []
-
-        for key, value in form.items():
-            if isinstance(value, UploadFile):
-                if key.startswith("diagram_"):
-                    idx = int(key.split("_")[1])
-                    diagrams[idx] = Image.open(BytesIO(await value.read()))
-                elif key == "answer_sheets":
-                    sheets.append(value)
+        if not sheets:
+            return {"error": "No answer sheets uploaded"}
 
         results = []
 
+        # =========================
+        # 🔥 LOAD Uni-MuMER ONLY HERE
+        # =========================
+        unimer_llm, unimer_sampling = load_unimer()
+
         for sheet_idx, sheet in enumerate(sheets):
+
             content = await sheet.read()
             images = convert_from_bytes(content)
 
@@ -177,25 +190,33 @@ async def similarity(
             os.makedirs(f"{sheet_dir}/formulas", exist_ok=True)
 
             all_texts = []
+            page_line_counts = []
 
+            # segmentation (uses Uni-MuMER)
             for img in images:
                 arr = np.array(img.convert("RGB"))
-                segment_lines_and_find_diagrams(
+                text_count, _ = segment_lines_and_find_diagrams(
                     arr,
                     output_folder=sheet_dir,
                     llm=unimer_llm,
                     sampling_params=unimer_sampling
                 )
+                page_line_counts.append(text_count)
+
+            # 🔥 FREE Uni-MuMER AFTER USE
+            del unimer_llm
+            clear_gpu()
 
             # OCR
-            text_files = os.listdir(f"{sheet_dir}/texts")
-            for f in text_files:
+            for f in os.listdir(f"{sheet_dir}/texts"):
                 with open(f"{sheet_dir}/texts/{f}", "rb") as file:
                     txt = ocr_from_image(file.read())
                     if txt.strip():
                         all_texts.append(txt.strip())
 
-            # Uni-MuMER output
+            ocr_lines = max(page_line_counts) if page_line_counts else len(all_texts)
+            ocr_lines = max(1, ocr_lines)
+
             latex_file = f"{sheet_dir}/formulas_latex.json"
             all_formulas = []
 
@@ -203,15 +224,10 @@ async def similarity(
                 latex_data = json.load(open(latex_file))
                 raw = [v for v in latex_data.values() if v]
 
-                ocr_lines = len(all_texts) if all_texts else len(raw)
-
-                print(f"🔄 Qwen restructuring ({ocr_lines} lines)")
+                # 🔥 Qwen runs AFTER Uni-MuMER is deleted
                 all_formulas = restructure_with_qwen(raw, ocr_lines)
 
-                for i, l in enumerate(all_formulas):
-                    print(f"{i+1}: {l}")
-
-            # scoring
+            # scoring (UNCHANGED)
             total = 0
             max_total = 0
 
@@ -221,18 +237,21 @@ async def similarity(
                     for line in all_formulas:
                         sim = max(sim, text_similarity(q["keyAnswer"], line))
 
-                score = sim * q.get("marks", 0)
+                marks = q.get("marks", 0)
+                score = sim * marks
+
                 total += score
-                max_total += q.get("marks", 0)
+                max_total += marks
 
             results.append({
                 "score": round(total, 2),
-                "total": max_total
+                "total": max_total,
+                "lines": all_formulas
             })
 
             shutil.rmtree(sheet_dir, ignore_errors=True)
 
-        return results[0]
+        return results[0] if results else {"score": 0, "total": 0}
 
     except Exception as e:
         traceback.print_exc()
