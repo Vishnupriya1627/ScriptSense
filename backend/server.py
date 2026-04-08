@@ -47,23 +47,29 @@ def clear_gpu():
 # =========================
 def load_unimer():
     print("🔄 Loading Uni-MuMER...")
+
     llm = LLM(
         model=UNIMER_MODEL_PATH,
         trust_remote_code=True,
         dtype="float16",
-        gpu_memory_utilization=0.80
+        gpu_memory_utilization=0.65,    
+        max_model_len=4096              
     )
+
     print("✅ Uni-MuMER loaded")
     return llm, SamplingParams(temperature=0, max_tokens=512)
 
 def load_qwen():
     print("🔄 Loading Qwen...")
+
     llm = LLM(
-        model=QWEN_MODEL_PATH,
+        model="Qwen/Qwen2-1.5B-Instruct",   
         trust_remote_code=True,
         dtype="float16",
-        gpu_memory_utilization=0.70
+        gpu_memory_utilization=0.50,        
+        max_model_len=2048                  
     )
+
     print("✅ Qwen loaded")
     return llm
 
