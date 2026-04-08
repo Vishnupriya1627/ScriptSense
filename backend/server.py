@@ -52,8 +52,8 @@ def load_unimer():
         model=UNIMER_MODEL_PATH,
         trust_remote_code=True,
         dtype="float16",
-        gpu_memory_utilization=0.90,   # 🔥 FIX
-        max_model_len=2048             # 🔥 FIX
+        gpu_memory_utilization=0.95,   # 🔥 MAX safe
+        max_model_len=1024             # 🔥 CRITICAL (big fix)
     )
 
     print("✅ Uni-MuMER loaded")
