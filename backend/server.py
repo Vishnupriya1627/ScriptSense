@@ -106,7 +106,7 @@ def load_qwen():
         model=QWEN_MODEL_PATH,
         trust_remote_code=True,
         dtype="float16",
-        gpu_memory_utilization=0.40,
+        gpu_memory_utilization=0.75,
         max_model_len=2048,
     )
     print("✅ Qwen loaded")
