@@ -41,20 +41,19 @@ UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
 QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
 
 # =========================
-# 🔹 GPU CLEAN
+# 🔹 GPU CLEAN (vLLM SAFE)
 # =========================
 
 def clear_gpu():
     try:
-        torch.cuda.empty_cache()
         gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()   # 🔥 important for vLLM
     except Exception:
         pass
 
 # =========================
 # 🔹 CLEAN Uni-MuMER OUTPUT
-# Merges spaced-out single chars: G r a d i e n t → Gradient
-# Preserves LaTeX math syntax ($ ... $)
 # =========================
 
 def clean_unimumer_output(text: str) -> str:
@@ -63,22 +62,20 @@ def clean_unimumer_output(text: str) -> str:
     if not text:
         return text
 
-    # Split on LaTeX math segments to protect them
     parts = re.split(r'(\$[^$]*\$)', text)
     cleaned_parts = []
 
     for part in parts:
         if part.startswith('$') and part.endswith('$'):
-            # LaTeX block — preserve as-is
             cleaned_parts.append(part)
         else:
-            # Merge spaced single characters: "G r a d" → "Grad"
-            # Only merge sequences of single chars separated by spaces
             merged = re.sub(
                 r'(?<!\S)((?:[A-Za-z0-9] )+[A-Za-z0-9])(?!\S)',
                 lambda m: m.group(0).replace(' ', ''),
                 part
             )
+            # 🔥 extra cleanup
+            merged = merged.replace(" .", ".").replace(" ,", ",")
             cleaned_parts.append(merged)
 
     return ''.join(cleaned_parts)
@@ -160,7 +157,6 @@ OUTPUT:
             while len(lines) < expected_lines:
                 lines.append(lines[-1] if lines else "")
 
-        # Log output
         print("\n==============================")
         print("🧠 QWEN STRUCTURED OUTPUT")
         print("==============================")
@@ -172,7 +168,7 @@ OUTPUT:
 
     except Exception as e:
         print("⚠️ Qwen error:", str(e))
-        return raw_lines  # fallback
+        return raw_lines
 
     finally:
         try:
@@ -210,12 +206,12 @@ async def similarity(
 
         results = []
 
-        # =========================
-        # 🔥 LOAD Uni-MuMER ONCE (outside sheet loop)
-        # =========================
-        unimer_llm, unimer_sampling = load_unimer()
-
         for sheet_idx, sheet in enumerate(answer_sheets):
+
+            # =========================
+            # 🔥 LOAD Uni-MuMER PER SHEET
+            # =========================
+            unimer_llm, unimer_sampling = load_unimer()
 
             content = await sheet.read()
             images  = convert_from_bytes(content)
@@ -226,7 +222,7 @@ async def similarity(
             raw_lines   = []
             line_counts = []
 
-            # 🔹 Segmentation — pass Uni-MuMER into each page
+            # 🔹 Segmentation
             for page_idx, img in enumerate(images):
                 arr = np.array(img.convert("RGB"))
 
@@ -240,31 +236,54 @@ async def similarity(
                 line_counts.append(count)
                 print(f"📄 Sheet {sheet_idx+1}, Page {page_idx+1}: {count} lines detected")
 
-            # 🔹 Read Uni-MuMER output and clean it
+            # 🔹 Read Uni-MuMER output
             latex_file = os.path.join(sheet_dir, "formulas_latex.json")
 
             if os.path.exists(latex_file):
                 with open(latex_file, "r") as f:
                     data = json.load(f)
 
-                raw_lines = []
                 print("\n==============================")
                 print("📝 Uni-MuMER RAW OUTPUT")
                 print("==============================")
+
                 for i, (k, v) in enumerate(data.items()):
                     if v:
                         cleaned = clean_unimumer_output(v)
                         raw_lines.append(cleaned)
                         print(f"Line {i+1}: {cleaned}")
+
                 print("==============================\n")
             else:
                 print(f"⚠️ No latex file found at {latex_file}")
 
-            expected_lines = max(line_counts) if line_counts else len(raw_lines)
+            # =========================
+            # 🔥 SMART LINE DETECTION
+            # =========================
+            expected_lines = max(
+                max(line_counts) if line_counts else 0,
+                len(raw_lines)
+            )
             expected_lines = max(1, expected_lines)
+
             print(f"📊 Expected lines: {expected_lines}")
 
-            # 🔥 QWEN restructure
+            # =========================
+            # 🔥 FREE Uni-MuMER BEFORE QWEN
+            # =========================
+            try:
+                del unimer_llm
+            except Exception:
+                pass
+
+            clear_gpu()
+
+            print("🧹 GPU after Uni-MuMER cleanup:",
+                  round(torch.cuda.memory_allocated()/1024**3, 2), "GB")
+
+            # =========================
+            # 🔥 QWEN RESTRUCTURE
+            # =========================
             structured_lines = restructure_with_qwen(raw_lines, expected_lines)
 
             # =========================
@@ -291,13 +310,6 @@ async def similarity(
             })
 
             shutil.rmtree(sheet_dir, ignore_errors=True)
-
-        # 🔥 FREE Uni-MuMER after all sheets are done
-        try:
-            del unimer_llm
-        except Exception:
-            pass
-        clear_gpu()
 
         return results[0] if results else {"score": 0, "total": 0}
 
