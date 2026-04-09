@@ -5,21 +5,17 @@ from Utils.segmentation import segment_lines_and_find_diagrams
 from Utils.similarity import text_similarity
 
 import numpy as np
-import os, sys, shutil, json, traceback, gc
+import os, sys, shutil, json, traceback, gc, re
 from typing import List
 
 import torch
+import cv2
 from vllm import LLM, SamplingParams
 
 # =========================
 # 🔹 APP INIT
 # =========================
-
 app = FastAPI()
-
-# =========================
-# 🔹 CORS
-# =========================
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,70 +23,87 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=3600,
 )
 
 # =========================
-# 🔹 PATH SETUP
+# 🔹 PATHS
 # =========================
-
 sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
 QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
 
 # =========================
-# 🔹 GPU CLEAN (vLLM SAFE)
+# 🔹 GPU CLEAN
 # =========================
-
 def clear_gpu():
     try:
         gc.collect()
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()   # 🔥 important for vLLM
-    except Exception:
+        torch.cuda.ipc_collect()
+    except:
         pass
+
+# =========================
+# 🔥 LINE DETECTION (IMAGE BASED)
+# =========================
+def detect_handwritten_lines(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+
+    _, thresh = cv2.threshold(
+        blur, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    projection = np.sum(thresh, axis=1)
+    threshold = np.max(projection) * 0.2
+
+    lines = 0
+    in_line = False
+
+    for val in projection:
+        if val > threshold and not in_line:
+            lines += 1
+            in_line = True
+        elif val <= threshold:
+            in_line = False
+
+    return max(1, lines)
 
 # =========================
 # 🔹 CLEAN Uni-MuMER OUTPUT
 # =========================
-
 def clean_unimumer_output(text: str) -> str:
-    import re
-
     if not text:
         return text
 
-    parts = re.split(r'(\$[^$]*\$)', text)
-    cleaned_parts = []
+    # merge spaced characters
+    text = re.sub(
+        r'(?<!\S)((?:[A-Za-z] )+[A-Za-z])(?!\S)',
+        lambda m: m.group(0).replace(' ', ''),
+        text
+    )
 
-    for part in parts:
-        if part.startswith('$') and part.endswith('$'):
-            cleaned_parts.append(part)
-        else:
-            merged = re.sub(
-                r'(?<!\S)((?:[A-Za-z0-9] )+[A-Za-z0-9])(?!\S)',
-                lambda m: m.group(0).replace(' ', ''),
-                part
-            )
-            # 🔥 extra cleanup
-            merged = merged.replace(" .", ".").replace(" ,", ",")
-            cleaned_parts.append(merged)
+    # fix spacing issues
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
+    text = re.sub(r'(\d)\.', r'\1. ', text)
 
-    return ''.join(cleaned_parts)
+    text = text.replace(" .", ".").replace(" ,", ",")
+
+    return text.strip()
 
 # =========================
 # 🔹 LOAD Uni-MuMER
 # =========================
-
 def load_unimer():
     print("🔄 Loading Uni-MuMER...")
     llm = LLM(
         model=UNIMER_MODEL_PATH,
         trust_remote_code=True,
         dtype="float16",
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.85,
         max_model_len=4096,
     )
     print("✅ Uni-MuMER loaded")
@@ -99,7 +112,6 @@ def load_unimer():
 # =========================
 # 🔹 LOAD QWEN
 # =========================
-
 def load_qwen():
     print("🔄 Loading Qwen...")
     llm = LLM(
@@ -107,58 +119,58 @@ def load_qwen():
         trust_remote_code=True,
         dtype="float16",
         gpu_memory_utilization=0.75,
-        max_model_len=2048,
+        max_model_len=1024,
     )
     print("✅ Qwen loaded")
     return llm
 
 # =========================
-# 🔹 QWEN RESTRUCTURE
+# 🔹 QWEN CLEANING ONLY
 # =========================
-
-def restructure_with_qwen(raw_lines: list, expected_lines: int) -> list:
+def restructure_with_qwen(raw_lines, expected_lines):
     if not raw_lines:
         return []
 
-    qwen_llm = None
+    qwen = None
     try:
-        qwen_llm = load_qwen()
+        qwen = load_qwen()
 
-        raw_text = "\n".join(raw_lines)
+        text = "\n".join(raw_lines)
 
-        prompt = f"""You are an expert system that reconstructs noisy OCR text from handwritten answers.
+        prompt = f"""
+You are an OCR post-processor.
 
-RULES:
-* Fix broken words (G r a d i e n t → Gradient)
-* Merge characters into words
-* Correct obvious OCR mistakes only when clear
-* DO NOT change meaning
-* DO NOT explain
-* DO NOT summarize
-* KEEP technical correctness
-* OUTPUT EXACTLY {expected_lines} lines
+TASK:
+Fix spacing and broken words in the text.
+
+STRICT RULES:
+- Do NOT add new content
+- Do NOT explain anything
+- Do NOT repeat the prompt
+- Do NOT include words like "RULES", "Answer", etc.
+- Keep SAME number of lines: {expected_lines}
+- Preserve original meaning exactly
 
 INPUT:
-{raw_text}
+{text}
 
-OUTPUT:
+OUTPUT (only cleaned text):
 """
 
         sampling = SamplingParams(temperature=0, max_tokens=1024)
-        outputs  = qwen_llm.generate([prompt], sampling)
-        result   = outputs[0].outputs[0].text.strip()
+        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
 
         lines = [l.strip() for l in result.split("\n") if l.strip()]
 
-        # Enforce exact line count
+        # enforce exact line count
         if len(lines) > expected_lines:
             lines = lines[:expected_lines]
-        elif len(lines) < expected_lines:
-            while len(lines) < expected_lines:
-                lines.append(lines[-1] if lines else "")
+
+        while len(lines) < expected_lines:
+            lines.append("")
 
         print("\n==============================")
-        print("🧠 QWEN STRUCTURED OUTPUT")
+        print("🧠 QWEN CLEANED OUTPUT")
         print("==============================")
         for i, line in enumerate(lines):
             print(f"Line {i+1}: {line}")
@@ -167,21 +179,19 @@ OUTPUT:
         return lines
 
     except Exception as e:
-        print("⚠️ Qwen error:", str(e))
+        print("⚠️ Qwen error:", e)
         return raw_lines
 
     finally:
         try:
-            if qwen_llm is not None:
-                del qwen_llm
-        except Exception:
+            del qwen
+        except:
             pass
         clear_gpu()
 
 # =========================
 # 🔹 HEALTH
 # =========================
-
 @app.get("/health")
 async def health():
     return {"status": "running"}
@@ -189,12 +199,11 @@ async def health():
 # =========================
 # 🔹 MAIN API
 # =========================
-
 @app.post("/similarity")
 async def similarity(
     request: Request,
     questions: str = Form(...),
-    answer_sheets: List[UploadFile] = File(...),
+    answer_sheets: List[UploadFile] = File(...)
 ):
     try:
         print("\n🚀 New request received")
@@ -208,10 +217,8 @@ async def similarity(
 
         for sheet_idx, sheet in enumerate(answer_sheets):
 
-            # =========================
-            # 🔥 LOAD Uni-MuMER PER SHEET
-            # =========================
-            unimer_llm, unimer_sampling = load_unimer()
+            # 🔥 LOAD Uni-MuMER
+            unimer, sampling = load_unimer()
 
             content = await sheet.read()
             images  = convert_from_bytes(content)
@@ -219,22 +226,24 @@ async def similarity(
             sheet_dir = f"output/sheet_{sheet_idx}"
             os.makedirs(sheet_dir, exist_ok=True)
 
-            raw_lines   = []
-            line_counts = []
+            raw_lines = []
+            detected_lines_all = []
 
-            # 🔹 Segmentation
+            # 🔹 Process pages
             for page_idx, img in enumerate(images):
                 arr = np.array(img.convert("RGB"))
+
+                # 🔥 real line detection
+                detected_lines_all.append(detect_handwritten_lines(arr))
 
                 count, _ = segment_lines_and_find_diagrams(
                     arr,
                     output_folder=sheet_dir,
-                    llm=unimer_llm,
-                    sampling_params=unimer_sampling,
+                    llm=unimer,
+                    sampling_params=sampling,
                 )
 
-                line_counts.append(count)
-                print(f"📄 Sheet {sheet_idx+1}, Page {page_idx+1}: {count} lines detected")
+                print(f"📄 Page {page_idx+1}: Uni-MuMER lines={count}")
 
             # 🔹 Read Uni-MuMER output
             latex_file = os.path.join(sheet_dir, "formulas_latex.json")
@@ -247,66 +256,43 @@ async def similarity(
                 print("📝 Uni-MuMER RAW OUTPUT")
                 print("==============================")
 
-                for i, (k, v) in enumerate(data.items()):
-                    if v:
-                        cleaned = clean_unimumer_output(v)
-                        raw_lines.append(cleaned)
-                        print(f"Line {i+1}: {cleaned}")
+                for i, v in enumerate(data.values()):
+                    cleaned = clean_unimumer_output(v)
+                    raw_lines.append(cleaned)
+                    print(f"Line {i+1}: {cleaned}")
 
                 print("==============================\n")
-            else:
-                print(f"⚠️ No latex file found at {latex_file}")
 
-            # =========================
-            # 🔥 SMART LINE DETECTION
-            # =========================
-            expected_lines = max(
-                max(line_counts) if line_counts else 0,
-                len(raw_lines)
-            )
+            # 🔥 determine expected lines
+            expected_lines = int(np.mean(detected_lines_all)) if detected_lines_all else len(raw_lines)
             expected_lines = max(1, expected_lines)
 
-            print(f"📊 Expected lines: {expected_lines}")
+            print("📊 Detected lines:", detected_lines_all)
+            print("📊 Expected lines:", expected_lines)
 
-            # =========================
-            # 🔥 FREE Uni-MuMER BEFORE QWEN
-            # =========================
-            try:
-                del unimer_llm
-            except Exception:
-                pass
-
+            # 🔥 unload Uni-MuMER
+            del unimer
             clear_gpu()
 
-            print("🧹 GPU after Uni-MuMER cleanup:",
-                  round(torch.cuda.memory_allocated()/1024**3, 2), "GB")
-
-            # =========================
-            # 🔥 QWEN RESTRUCTURE
-            # =========================
+            # 🔥 Qwen cleaning
             structured_lines = restructure_with_qwen(raw_lines, expected_lines)
 
-            # =========================
-            # 🔹 SCORING
-            # =========================
-            total     = 0
+            # 🔹 scoring
+            total = 0
             max_total = 0
 
             for q in questions_data:
-                sim = 0.0
+                sim = 0
+                for line in structured_lines:
+                    sim = max(sim, text_similarity(q["keyAnswer"], line))
 
-                if q.get("keyAnswer"):
-                    for line in structured_lines:
-                        sim = max(sim, text_similarity(q["keyAnswer"], line))
-
-                marks      = q.get("marks", 0)
-                total     += sim * marks
-                max_total += marks
+                total += sim * q["marks"]
+                max_total += q["marks"]
 
             results.append({
                 "score": round(total, 2),
                 "total": max_total,
-                "lines": structured_lines,
+                "lines": structured_lines
             })
 
             shutil.rmtree(sheet_dir, ignore_errors=True)
