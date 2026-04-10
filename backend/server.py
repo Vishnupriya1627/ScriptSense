@@ -28,7 +28,14 @@ app.add_middleware(
 sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
-QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct" 
+QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
+
+# =========================
+# 🔹 GLOBAL MODELS
+# =========================
+unimer_llm = None
+unimer_sampling = None
+qwen_llm = None
 
 # =========================
 # 🔹 GPU CLEAN
@@ -69,35 +76,42 @@ def load_qwen():
     return llm
 
 # =========================
-# 🔹 STRONG CLEAN Uni-MuMER TEXT
+# 🔹 STARTUP LOAD
+# =========================
+@app.on_event("startup")
+def startup_event():
+    global unimer_llm, unimer_sampling, qwen_llm
+
+    clear_gpu()
+    unimer_llm, unimer_sampling = load_unimer()
+    qwen_llm = load_qwen()
+
+# =========================
+# 🔹 CLEAN Uni-MuMER TEXT
 # =========================
 def clean_unimumer_output(text):
     if not text:
         return ""
 
-    # merge spaced letters (VERY IMPORTANT FIX)
     text = re.sub(
         r'(?<!\S)(?:[A-Za-z]\s){2,}[A-Za-z](?!\S)',
         lambda m: m.group(0).replace(" ", ""),
         text
     )
 
-    # normalize spacing
     text = re.sub(r'\s+', ' ', text)
     text = text.replace(" .", ".").replace(" ,", ",")
 
     return text.strip()
 
 # =========================
-# 🔹 ROBUST OCR LINE COUNT
+# 🔹 OCR LINE COUNT
 # =========================
 def get_clean_line_count(ocr_counts):
     if not ocr_counts:
         return 3
 
-    # remove noisy small detections
     filtered = [c for c in ocr_counts if c >= 5]
-
     if not filtered:
         filtered = ocr_counts
 
@@ -112,7 +126,7 @@ def get_clean_line_count(ocr_counts):
     return max(3, min(median, 25))
 
 # =========================
-# 🔹 PYTHON SPLIT (PRIMARY STRUCTURE)
+# 🔹 SPLIT LINES
 # =========================
 def split_into_lines(text, n_lines):
     words = text.split()
@@ -133,10 +147,8 @@ def split_into_lines(text, n_lines):
 # 🔹 QWEN RESTRUCTURE
 # =========================
 def restructure_with_qwen(lines):
-    qwen = None
+    global qwen_llm
     try:
-        qwen = load_qwen()
-
         text = "\n".join(lines)
 
         prompt = f"""
@@ -153,29 +165,21 @@ Rules:
 """
 
         sampling = SamplingParams(temperature=0, max_tokens=512)
-        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
+        result = qwen_llm.generate([prompt], sampling)[0].outputs[0].text.strip()
 
         new_lines = [l.strip() for l in result.split("\n") if l.strip()]
-
         return new_lines if new_lines else lines
 
     except Exception as e:
         print("⚠️ Qwen restructure error:", e)
         return lines
 
-    finally:
-        if qwen:
-            del qwen
-        clear_gpu()
-
 # =========================
-# 🔹 QWEN FINAL CLEAN
+# 🔹 QWEN CLEAN
 # =========================
 def clean_with_qwen(lines):
-    qwen = None
+    global qwen_llm
     try:
-        qwen = load_qwen()
-
         text = "\n".join(lines)
 
         prompt = f"""
@@ -190,7 +194,7 @@ Rules:
 """
 
         sampling = SamplingParams(temperature=0, max_tokens=512)
-        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
+        result = qwen_llm.generate([prompt], sampling)[0].outputs[0].text.strip()
 
         cleaned = [l.strip() for l in result.split("\n")]
 
@@ -202,11 +206,6 @@ Rules:
     except Exception as e:
         print("⚠️ Qwen clean error:", e)
         return lines
-
-    finally:
-        if qwen:
-            del qwen
-        clear_gpu()
 
 # =========================
 # 🔹 HEALTH
@@ -227,11 +226,10 @@ async def similarity(
     try:
         print("\n🚀 New request")
 
+        global unimer_llm, unimer_sampling
+
         questions_data = json.loads(questions)
         results = []
-
-        # 🔥 Load Uni-MuMER ONCE
-        unimer, sampling = load_unimer()
 
         for sheet_idx, sheet in enumerate(answer_sheets):
 
@@ -252,13 +250,9 @@ async def similarity(
                 segment_lines_and_find_diagrams(
                     arr,
                     output_folder=sheet_dir,
-                    llm=unimer,
-                    sampling_params=sampling,
+                    llm=unimer_llm,
+                    sampling_params=unimer_sampling,
                 )
-
-            # 🔥 FREE Uni-MuMER
-            del unimer
-            clear_gpu()
 
             # =========================
             # 🔹 READ Uni-MuMER OUTPUT
