@@ -2,7 +2,6 @@ from fastapi import FastAPI, File, UploadFile, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pdf2image import convert_from_bytes
 from Utils.segmentation import segment_lines_and_find_diagrams
-from Utils.similarity import text_similarity
 from Utils.ocr import ocr_from_image
 
 import numpy as np
@@ -11,6 +10,7 @@ from typing import List
 
 import torch
 from vllm import LLM, SamplingParams
+from vllm.distributed.parallel_state import destroy_model_parallel
 
 # =========================
 # 🔹 APP INIT
@@ -37,72 +37,45 @@ QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
 
 # =========================
 # 🔹 GLOBAL MODEL STATE
-# Key idea: Uni-MuMER loads fresh per request (too big to keep alongside Qwen),
-# but Qwen is loaded ONCE after first use and kept alive for all subsequent requests.
-# This avoids the ~40s Qwen reload on every request which was killing ngrok.
+# Only one model lives in GPU at a time.
+# Qwen persists across requests; unloaded only when Uni-MuMER needs to load.
 # =========================
-_qwen_llm = None      # persists across requests
+_qwen_llm      = None
 _qwen_sampling = None
 
 # =========================
-# 🔹 GPU CLEAN
+# 🔹 FULL vLLM TEARDOWN
+# torch.cuda.empty_cache() alone does NOT release vLLM's internal CUDA pool.
+# destroy_model_parallel() is required before the next model can load.
 # =========================
-def clear_gpu():
+def destroy_llm(llm):
     try:
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    except:
+        destroy_model_parallel()
+    except Exception:
         pass
+    try:
+        del llm
+    except Exception:
+        pass
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    print("🗑️  Model destroyed, GPU freed")
 
 # =========================
-# 🔹 OCR‑BASED LINE COUNT
-# =========================
-def get_clean_line_count(ocr_counts):
-    if not ocr_counts:
-        return 3
-
-    filtered = [c for c in ocr_counts if c >= 5]
-    if not filtered:
-        filtered = ocr_counts
-
-    filtered.sort()
-    mid = len(filtered) // 2
-
-    if len(filtered) % 2 == 0:
-        median = (filtered[mid - 1] + filtered[mid]) // 2
-    else:
-        median = filtered[mid]
-
-    return max(3, min(median, 25))
-
-# =========================
-# 🔹 CLEAN Uni-MuMER OUTPUT
-# =========================
-def clean_unimumer_output(text: str) -> str:
-    if not text:
-        return text
-
-    # merge spaced-out single characters e.g. "G r a d i e n t" → "Gradient"
-    text = re.sub(
-        r'(?<!\S)((?:[A-Za-z] )+[A-Za-z])(?!\S)',
-        lambda m: m.group(0).replace(' ', ''),
-        text
-    )
-
-    # fix missing spaces between camelCase-merged words
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-    text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
-    text = re.sub(r'(\d)\.', r'\1. ', text)
-
-    text = text.replace(" .", ".").replace(" ,", ",")
-
-    return text.strip()
-
-# =========================
-# 🔹 LOAD Uni-MuMER (per-request, unloaded before Qwen)
+# 🔹 LOAD Uni-MuMER
+# Always unloads Qwen first if alive.
 # =========================
 def load_unimer():
+    global _qwen_llm, _qwen_sampling
+
+    if _qwen_llm is not None:
+        print("🗑️  Unloading Qwen before Uni-MuMER...")
+        q = _qwen_llm
+        _qwen_llm = None
+        _qwen_sampling = None
+        destroy_llm(q)
+
     print("🔄 Loading Uni-MuMER...")
     llm = LLM(
         model=UNIMER_MODEL_PATH,
@@ -115,12 +88,13 @@ def load_unimer():
     return llm, SamplingParams(temperature=0, max_tokens=512)
 
 # =========================
-# 🔹 GET QWEN (singleton — loads once, stays alive)
+# 🔹 GET QWEN (singleton)
+# Loads once after Uni-MuMER is destroyed, stays alive for all subsequent passes.
 # =========================
 def get_qwen():
     global _qwen_llm, _qwen_sampling
     if _qwen_llm is None:
-        print("🔄 Loading Qwen (first time)...")
+        print("🔄 Loading Qwen...")
         _qwen_llm = LLM(
             model=QWEN_MODEL_PATH,
             trust_remote_code=True,
@@ -135,63 +109,180 @@ def get_qwen():
     return _qwen_llm, _qwen_sampling
 
 # =========================
-# 🔹 QWEN CLEANING
-# FIX: use proper chat format so model doesn't echo the prompt back
+# 🔹 CLEAN Uni-MuMER OUTPUT
+# Merges spaced-out single characters: "G r a d i e n t" → "Gradient"
 # =========================
-def restructure_with_qwen(raw_lines, expected_lines):
-    if not raw_lines:
+def clean_unimumer_output(text: str) -> str:
+    if not text:
+        return text
+
+    text = re.sub(
+        r'(?<!\S)((?:[A-Za-z] )+[A-Za-z])(?!\S)',
+        lambda m: m.group(0).replace(' ', ''),
+        text
+    )
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
+    text = re.sub(r'(\d)\.', r'\1. ', text)
+    text = text.replace(" .", ".").replace(" ,", ",")
+
+    return text.strip()
+
+# =========================
+# 🔹 OCR LINE COUNT
+# Reads the texts/ folder written by segment_lines_and_find_diagrams.
+# Takes the median across pages to ignore outliers (diagrams, blank pages).
+# =========================
+def get_ocr_line_count(sheet_dir: str) -> int:
+    text_folder = os.path.join(sheet_dir, "texts")
+    counts = []
+
+    if os.path.exists(text_folder):
+        for filename in sorted(os.listdir(text_folder)):
+            filepath = os.path.join(text_folder, filename)
+            with open(filepath, "rb") as f:
+                txt = ocr_from_image(f.read())
+            lines = [l for l in txt.split("\n") if l.strip()]
+            count = len(lines)
+            print(f"  📋 OCR [{filename}]: {count} lines")
+            counts.append(count)
+
+    print(f"📊 OCR counts per image: {counts}")
+
+    if not counts:
+        return 5
+
+    filtered = [c for c in counts if c >= 5]
+    if not filtered:
+        filtered = counts
+    filtered.sort()
+    mid = len(filtered) // 2
+    median = (filtered[mid - 1] + filtered[mid]) // 2 if len(filtered) % 2 == 0 else filtered[mid]
+    result = max(3, min(median, 40))
+    print(f"📊 Final expected line count: {result}")
+    return result
+
+# =========================
+# 🔹 QWEN PASS 1 — CLEAN + SPLIT
+# Takes the raw Uni-MuMER text blob (merged words, no spacing)
+# and produces exactly `expected_lines` clean lines matching the handwriting layout.
+# =========================
+def qwen_clean_and_split(raw_text: str, expected_lines: int) -> list:
+    if not raw_text.strip():
         return []
 
-    try:
-        qwen, sampling = get_qwen()
+    qwen, sampling = get_qwen()
 
-        text = "\n".join(raw_lines)
+    system_msg = (
+        "You are an OCR post-processor for handwritten answer sheets. "
+        "You receive a block of OCR text with spacing issues and merged words. "
+        "Your job: fix all spacing/broken words, then split the corrected text "
+        f"into exactly {expected_lines} lines that reflect the natural sentence "
+        "and paragraph breaks in the original handwriting. "
+        "Output ONLY the fixed text — one line of output per line of handwriting. "
+        "No labels, no numbering, no explanations, no extra lines."
+    )
 
-        # Use chat-style formatting with clear system/user separation.
-        # The previous single-block prompt caused the model to echo instructions.
-        # With chat format, the model only sees "assistant turn starts here" and fills it.
-        system_msg = (
-            "You are an OCR post-processor. "
-            "Fix spacing and broken words in the input text. "
-            "Output ONLY the fixed text. "
-            "Do NOT repeat instructions, rules, labels, or any explanation. "
-            "Do NOT add new content. "
-            "Preserve the original meaning exactly."
+    user_msg = f"Fix and split into exactly {expected_lines} lines:\n\n{raw_text}"
+
+    prompt = (
+        f"<|im_start|>system\n{system_msg}<|im_end|>\n"
+        f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    result = qwen.generate([prompt], sampling)[0].outputs[0].text
+    result = result.replace("<|im_end|>", "").strip()
+
+    lines = [l.strip() for l in result.split("\n") if l.strip()]
+
+    if len(lines) > expected_lines:
+        lines = lines[:expected_lines]
+    while len(lines) < expected_lines:
+        lines.append("")
+
+    print("\n==============================")
+    print("🧹 QWEN PASS 1: CLEANED + SPLIT")
+    print("==============================")
+    for i, line in enumerate(lines):
+        print(f"Line {i+1}: {line}")
+    print("==============================\n")
+
+    return lines
+
+# =========================
+# 🔹 QWEN PASS 2 — EVALUATE
+# For each question: send key answer + full student text to Qwen.
+# Qwen returns {"score": x, "reason": "..."} JSON.
+# Scores are summed across all questions.
+# =========================
+def qwen_evaluate(structured_lines: list, questions_data: list) -> dict:
+    qwen, sampling = get_qwen()
+
+    student_text = "\n".join(l for l in structured_lines if l.strip())
+    total_score  = 0.0
+    max_total    = 0
+    per_question = []
+
+    system_msg = (
+        "You are a strict but fair exam evaluator. "
+        "You will be given a key answer and a student's handwritten answer. "
+        "Evaluate the student's answer based on conceptual correctness and coverage of key points. "
+        "Respond with ONLY a valid JSON object in this exact format with no other text: "
+        '{"score": <number>, "reason": "<one concise sentence>"}'
+    )
+
+    print("\n==============================")
+    print("📝 QWEN PASS 2: EVALUATION")
+    print("==============================")
+
+    for i, q in enumerate(questions_data):
+        key_answer = q.get("keyAnswer", "")
+        marks      = q.get("marks", 1)
+        max_total += marks
+
+        user_msg = (
+            f"Key Answer: {key_answer}\n\n"
+            f"Student's Answer:\n{student_text}\n\n"
+            f"Maximum marks for this question: {marks}\n"
+            f"Give a score between 0 and {marks}."
         )
 
-        user_msg = f"Fix the spacing in this OCR output:\n\n{text}"
+        prompt = (
+            f"<|im_start|>system\n{system_msg}<|im_end|>\n"
+            f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
 
-        # vLLM chat template format
-        prompt = f"<|im_start|>system\n{system_msg}<|im_end|>\n<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n"
+        raw = ""
+        try:
+            raw = qwen.generate([prompt], sampling)[0].outputs[0].text
+            raw = raw.replace("<|im_end|>", "").strip()
+            raw_clean = re.sub(r"```[a-z]*|```", "", raw).strip()
 
-        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
+            parsed = json.loads(raw_clean)
+            score  = float(parsed.get("score", 0))
+            reason = parsed.get("reason", "")
 
-        # Strip any trailing <|im_end|> tokens vLLM may leave
-        result = result.replace("<|im_end|>", "").strip()
+            # Clamp to valid range
+            score = max(0.0, min(float(marks), score))
 
-        lines = [l.strip() for l in result.split("\n") if l.strip()]
+            print(f"  Q{i+1}: {score}/{marks} — {reason}")
+            per_question.append({"score": score, "marks": marks, "reason": reason})
+            total_score += score
 
-        # Enforce line count
-        if len(lines) > expected_lines:
-            lines = lines[:expected_lines]
-        while len(lines) < expected_lines:
-            lines.append("")
+        except Exception as e:
+            print(f"  ⚠️ Q{i+1} eval failed: {e} | raw='{raw}'")
+            per_question.append({"score": 0, "marks": marks, "reason": "Evaluation failed"})
 
-        print("\n==============================")
-        print("🧠 QWEN CLEANED OUTPUT")
-        print("==============================")
-        for i, line in enumerate(lines):
-            print(f"Line {i+1}: {line}")
-        print("==============================\n")
+    print(f"\n✅ Final Score: {total_score}/{max_total}")
+    print("==============================\n")
 
-        return lines
-
-    except Exception as e:
-        print("⚠️ Qwen error:", e)
-        traceback.print_exc()
-        return raw_lines
-
-    # ✅ Do NOT del qwen here — we want it to stay alive for next request
+    return {
+        "score": round(total_score, 2),
+        "total": max_total,
+        "per_question": per_question,
+    }
 
 # =========================
 # 🔹 HEALTH
@@ -202,6 +293,16 @@ async def health():
 
 # =========================
 # 🔹 MAIN API
+#
+# Flow per request:
+#   1. Unload Qwen if alive (so Uni-MuMER has full VRAM)
+#   2. Load Uni-MuMER → recognize text from all pages → merge into one blob
+#   3. Read OCR line count from texts/ folder (written by segmentation)
+#   4. Destroy Uni-MuMER (full vLLM teardown)
+#   5. Load Qwen (or reuse if already cached)
+#   6. Qwen Pass 1: fix spacing + split into OCR line count
+#   7. Qwen Pass 2: evaluate each question against key answer
+#   8. Return score, per_question breakdown, and structured lines
 # =========================
 @app.post("/similarity")
 async def similarity(
@@ -221,34 +322,27 @@ async def similarity(
 
         for sheet_idx, sheet in enumerate(answer_sheets):
 
-            # 🔥 Load Uni-MuMER fresh for this sheet
-            unimer, sampling = load_unimer()
+            sheet_dir = f"output/sheet_{sheet_idx}"
+            os.makedirs(sheet_dir, exist_ok=True)
+
+            # ── STAGE 1: Uni-MuMER recognition ──────────────────────────────
+            unimer, u_sampling = load_unimer()
 
             content = await sheet.read()
             images  = convert_from_bytes(content)
 
-            sheet_dir = f"output/sheet_{sheet_idx}"
-            os.makedirs(sheet_dir, exist_ok=True)
-
-            raw_lines = []
-            ocr_counts = []
-
-            # 🔹 Process each page with Uni-MuMER + OCR line count
             for page_idx, img in enumerate(images):
                 arr = np.array(img.convert("RGB"))
-
                 count, _ = segment_lines_and_find_diagrams(
                     arr,
                     output_folder=sheet_dir,
                     llm=unimer,
-                    sampling_params=sampling,
+                    sampling_params=u_sampling,
                 )
                 print(f"📄 Page {page_idx+1}: Uni-MuMER lines={count}")
 
-                # OCR line count collected per page image here
-                # (kept same logic as original — reads from texts/ folder below)
-
-            # 🔹 Read Uni-MuMER output
+            # Merge all Uni-MuMER output into one text blob
+            raw_text  = ""
             latex_file = os.path.join(sheet_dir, "formulas_latex.json")
 
             if os.path.exists(latex_file):
@@ -259,52 +353,37 @@ async def similarity(
                 print("📝 Uni-MuMER RAW OUTPUT")
                 print("==============================")
 
+                raw_parts = []
                 for i, v in enumerate(data.values()):
                     cleaned = clean_unimumer_output(v)
-                    raw_lines.append(cleaned)
-                    print(f"Line {i+1}: {cleaned}")
+                    if cleaned.strip():
+                        raw_parts.append(cleaned)
+                        print(f"Line {i+1}: {cleaned}")
 
+                # Join as a single blob — Qwen will re-split by line count
+                raw_text = " ".join(raw_parts)
                 print("==============================\n")
 
-            # 🔥 UNLOAD Uni-MuMER before loading Qwen (free ~7GB)
+            # ── STAGE 2: OCR line count (texts/ folder still exists here) ───
+            expected_lines = get_ocr_line_count(sheet_dir)
+
+            # ── STAGE 3: Destroy Uni-MuMER ───────────────────────────────────
+            destroy_llm(unimer)
             del unimer
-            clear_gpu()
-            print("🗑️ Uni-MuMER unloaded, GPU freed")
 
-            # 🔹 OCR-based line count
-            text_folder = os.path.join(sheet_dir, "texts")
-            if os.path.exists(text_folder):
-                for filename in os.listdir(text_folder):
-                    filepath = os.path.join(text_folder, filename)
-                    with open(filepath, "rb") as f:
-                        txt = ocr_from_image(f.read())
-                        if txt.strip():
-                            ocr_counts.append(len(txt.split("\n")))
+            # ── STAGE 4: Qwen Pass 1 — clean + split ─────────────────────────
+            print("🧠 Qwen Pass 1: Cleaning and splitting into lines...")
+            structured_lines = qwen_clean_and_split(raw_text, expected_lines)
 
-            expected_lines = get_clean_line_count(ocr_counts)
-
-            print(f"📊 OCR line counts per image: {ocr_counts}")
-            print(f"📊 Final expected lines: {expected_lines}")
-
-            # 🔥 Qwen cleaning (singleton — fast after first load)
-            structured_lines = restructure_with_qwen(raw_lines, expected_lines)
-
-            # 🔹 Scoring
-            total = 0
-            max_total = 0
-
-            for q in questions_data:
-                sim = 0
-                for line in structured_lines:
-                    sim = max(sim, text_similarity(q["keyAnswer"], line))
-
-                total += sim * q["marks"]
-                max_total += q["marks"]
+            # ── STAGE 5: Qwen Pass 2 — evaluate ──────────────────────────────
+            print("🧠 Qwen Pass 2: Evaluating against answer key...")
+            eval_result = qwen_evaluate(structured_lines, questions_data)
 
             results.append({
-                "score": round(total, 2),
-                "total": max_total,
-                "lines": structured_lines
+                "score":        eval_result["score"],
+                "total":        eval_result["total"],
+                "per_question": eval_result["per_question"],
+                "lines":        structured_lines,
             })
 
             shutil.rmtree(sheet_dir, ignore_errors=True)
