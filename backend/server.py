@@ -35,8 +35,6 @@ QWEN_MODEL_PATH = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
 
 # =========================
 # 🔹 GLOBAL QWEN STATE
-# Uni-MuMER runs in a subprocess — OS releases its CUDA memory on exit.
-# Qwen safely persists in the main process across requests.
 # =========================
 _qwen_llm      = None
 _qwen_sampling = None
@@ -95,7 +93,6 @@ def run_unimer_subprocess(images: list, sheet_dir: str) -> dict:
 
 # =========================
 # 🔹 HELPER: wrap text into lines of ~8 words each
-# Used for the student_answer display field.
 # =========================
 def wrap_into_lines(text: str, words_per_line: int = 8) -> list:
     words = text.split()
@@ -106,8 +103,6 @@ def wrap_into_lines(text: str, words_per_line: int = 8) -> list:
 
 # =========================
 # 🔹 QWEN PASS 1 — CLEAN TEXT (for display to professors)
-# Fixes OCR noise and returns clean, readable prose.
-# We then wrap it into ~8-word lines ourselves — no need to ask Qwen to count.
 # =========================
 def qwen_clean_text(raw_text: str) -> str:
     if not raw_text.strip():
@@ -144,7 +139,6 @@ def qwen_clean_text(raw_text: str) -> str:
 
 # =========================
 # 🔹 QWEN PASS 2 — EXTRACT KEY POINTS
-# Takes the already-cleaned text and extracts short semantic key-point phrases.
 # =========================
 def qwen_extract_key_points(cleaned_text: str) -> list:
     if not cleaned_text.strip():
@@ -196,8 +190,6 @@ def qwen_extract_key_points(cleaned_text: str) -> list:
 
 # =========================
 # 🔹 QWEN PASS 3 — EVALUATE
-# For each {keyAnswer, marks}: evaluate key points vs key answer.
-# Returns {"score": x, "remarks": "..."} per question.
 # =========================
 def qwen_evaluate(key_points: list, questions_data: list) -> dict:
     qwen, sampling = get_qwen()
@@ -276,25 +268,6 @@ async def health():
 
 # =========================
 # 🔹 MAIN API
-#
-# Response shape:
-# {
-#   "score": 7.0,
-#   "total": 10,
-#   "student_answer": [          ← clean digitized text, ~8 words per line, for professors
-#     "Gradient descent in deep learning is the",
-#     "core optimization algorithm used in training",
-#     ...
-#   ],
-#   "key_points": [              ← short semantic phrases used for evaluation
-#     "Gradient descent minimizes loss function",
-#     "Weights updated via backpropagation",
-#     ...
-#   ],
-#   "per_question": [
-#     {"score": 7.0, "marks": 10, "remarks": "..."}
-#   ]
-# }
 # =========================
 @app.post("/similarity")
 async def similarity(
@@ -330,7 +303,7 @@ async def similarity(
             print("🧠 Qwen Pass 1: Cleaning OCR text...")
             cleaned_text = qwen_clean_text(raw_text)
 
-            # Wrap cleaned text into ~8-word lines for professor display
+            # Wrap into ~8-word lines for professor display (done in Python, not Qwen)
             student_answer_lines = wrap_into_lines(cleaned_text, words_per_line=8)
 
             # ── STAGE 3: Qwen Pass 2 — extract key points ───────────────────
@@ -341,14 +314,22 @@ async def similarity(
             print("🧠 Qwen Pass 3: Evaluating against answer key...")
             eval_result = qwen_evaluate(key_points, questions_data)
 
-            results.append({
+            final_result = {
                 "score":          eval_result["score"],
                 "total":          eval_result["total"],
                 "student_answer": student_answer_lines,
                 "key_points":     key_points,
                 "per_question":   eval_result["per_question"],
-            })
+            }
 
+            # ── FULL JSON LOG ────────────────────────────────────────────────
+            print("\n" + "=" * 60)
+            print("📦 FINAL RESPONSE JSON")
+            print("=" * 60)
+            print(json.dumps(final_result, indent=2))
+            print("=" * 60 + "\n")
+
+            results.append(final_result)
             shutil.rmtree(sheet_dir, ignore_errors=True)
 
         return results[0] if results else {"score": 0, "total": 0}
