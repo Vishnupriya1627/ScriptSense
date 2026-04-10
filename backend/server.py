@@ -28,7 +28,7 @@ app.add_middleware(
 sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
-QWEN_MODEL_PATH   = "/content/models/Qwen2.5-3B-Instruct"
+QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"  # ✅ FIXED
 
 # =========================
 # 🔹 GPU CLEAN
@@ -53,6 +53,7 @@ def load_unimer():
         gpu_memory_utilization=0.90,
         max_model_len=2048
     )
+    print("✅ Uni-MuMER loaded")
     return llm, SamplingParams(temperature=0, max_tokens=512)
 
 def load_qwen():
@@ -64,28 +65,54 @@ def load_qwen():
         gpu_memory_utilization=0.50,
         max_model_len=1024
     )
+    print("✅ Qwen loaded")
     return llm
 
 # =========================
-# 🔹 CLEAN Uni-MuMER TEXT
+# 🔹 STRONG CLEAN Uni-MuMER TEXT
 # =========================
 def clean_unimumer_output(text):
     if not text:
         return ""
 
+    # merge spaced letters (VERY IMPORTANT FIX)
     text = re.sub(
-        r'(?<!\S)((?:[A-Za-z] )+[A-Za-z])(?!\S)',
-        lambda m: m.group(0).replace(' ', ''),
+        r'(?<!\S)(?:[A-Za-z]\s){2,}[A-Za-z](?!\S)',
+        lambda m: m.group(0).replace(" ", ""),
         text
     )
 
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-    text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
+    # normalize spacing
+    text = re.sub(r'\s+', ' ', text)
+    text = text.replace(" .", ".").replace(" ,", ",")
 
     return text.strip()
 
 # =========================
-# 🔹 PYTHON SPLIT (PRIMARY)
+# 🔹 ROBUST OCR LINE COUNT
+# =========================
+def get_clean_line_count(ocr_counts):
+    if not ocr_counts:
+        return 3
+
+    # remove noisy small detections
+    filtered = [c for c in ocr_counts if c >= 5]
+
+    if not filtered:
+        filtered = ocr_counts
+
+    filtered.sort()
+    mid = len(filtered) // 2
+
+    if len(filtered) % 2 == 0:
+        median = (filtered[mid - 1] + filtered[mid]) // 2
+    else:
+        median = filtered[mid]
+
+    return max(3, min(median, 25))
+
+# =========================
+# 🔹 PYTHON SPLIT (PRIMARY STRUCTURE)
 # =========================
 def split_into_lines(text, n_lines):
     words = text.split()
@@ -103,7 +130,7 @@ def split_into_lines(text, n_lines):
     return lines
 
 # =========================
-# 🔹 QWEN RESTRUCTURE (SECONDARY)
+# 🔹 QWEN RESTRUCTURE
 # =========================
 def restructure_with_qwen(lines):
     qwen = None
@@ -113,11 +140,12 @@ def restructure_with_qwen(lines):
         text = "\n".join(lines)
 
         prompt = f"""
-Rearrange text into better natural line breaks.
+Rearrange text into natural handwritten-style lines.
 
 Rules:
-- Keep same meaning
 - Do NOT add content
+- Do NOT remove content
+- Keep meaning same
 - Keep similar number of lines
 - No explanations
 
@@ -141,7 +169,7 @@ Rules:
         clear_gpu()
 
 # =========================
-# 🔹 QWEN CLEAN (FINAL)
+# 🔹 QWEN FINAL CLEAN
 # =========================
 def clean_with_qwen(lines):
     qwen = None
@@ -156,7 +184,7 @@ Fix spacing and broken words ONLY.
 Rules:
 - Do NOT change meaning
 - Do NOT add content
-- Keep same number of lines
+- Keep SAME number of lines
 
 {text}
 """
@@ -243,7 +271,7 @@ async def similarity(
                     raw_text += " " + clean_unimumer_output(v)
 
             # =========================
-            # 🔹 OCR LINE COUNT ONLY
+            # 🔹 OCR LINE COUNT
             # =========================
             ocr_counts = []
 
@@ -255,16 +283,15 @@ async def similarity(
                         if txt.strip():
                             ocr_counts.append(len(txt.split("\n")))
 
-            final_lines = max(ocr_counts) if ocr_counts else 3
-            final_lines = min(max(final_lines, 2), 12)
+            final_lines = get_clean_line_count(ocr_counts)
 
-            print(f"📊 OCR line count: {final_lines}")
+            print(f"📊 OCR counts: {ocr_counts}")
+            print(f"📊 Final line count: {final_lines}")
 
             # =========================
-            # 🔹 STRUCTURE + CLEAN
+            # 🔹 STRUCTURE PIPELINE
             # =========================
             structured_lines = split_into_lines(raw_text, final_lines)
-
             structured_lines = restructure_with_qwen(structured_lines)
             structured_lines = clean_with_qwen(structured_lines)
 
