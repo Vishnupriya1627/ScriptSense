@@ -6,17 +6,17 @@ from Utils.ocr import ocr_from_image
 from Utils.similarity import text_similarity
 
 import numpy as np
-import os, sys, shutil, json, traceback, gc
+import os, sys, shutil, json, traceback, gc, re
 from typing import List
 
 import torch
 from vllm import LLM, SamplingParams
 
+# =========================
+# 🔹 APP INIT
+# =========================
 app = FastAPI()
 
-# =========================
-# 🔹 CORS
-# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,9 +25,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# 🔹 PATH SETUP
-# =========================
 sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
@@ -37,8 +34,12 @@ QWEN_MODEL_PATH   = "/content/models/Qwen2.5-3B-Instruct"
 # 🔹 GPU CLEAN
 # =========================
 def clear_gpu():
-    torch.cuda.empty_cache()
-    gc.collect()
+    try:
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    except:
+        pass
 
 # =========================
 # 🔹 LOADERS
@@ -49,8 +50,8 @@ def load_unimer():
         model=UNIMER_MODEL_PATH,
         trust_remote_code=True,
         dtype="float16",
-        gpu_memory_utilization=0.95,
-        max_model_len=1024
+        gpu_memory_utilization=0.90,
+        max_model_len=2048
     )
     return llm, SamplingParams(temperature=0, max_tokens=512)
 
@@ -69,25 +70,22 @@ def load_qwen():
 # 🔹 CLEAN Uni-MuMER TEXT
 # =========================
 def clean_unimumer_output(text):
-    tokens = text.split(' ')
-    result = []
-    i = 0
+    if not text:
+        return ""
 
-    while i < len(tokens):
-        if len(tokens[i]) == 1:
-            word = tokens[i]
-            while i + 1 < len(tokens) and len(tokens[i + 1]) == 1:
-                word += tokens[i + 1]
-                i += 1
-            result.append(word)
-        else:
-            result.append(tokens[i])
-        i += 1
+    text = re.sub(
+        r'(?<!\S)((?:[A-Za-z] )+[A-Za-z])(?!\S)',
+        lambda m: m.group(0).replace(' ', ''),
+        text
+    )
 
-    return ' '.join(result)
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
+
+    return text.strip()
 
 # =========================
-# 🔹 SMART LINE SPLIT (🔥 CORE FIX)
+# 🔹 PYTHON SPLIT (PRIMARY)
 # =========================
 def split_into_lines(text, n_lines):
     words = text.split()
@@ -105,12 +103,50 @@ def split_into_lines(text, n_lines):
     return lines
 
 # =========================
-# 🔹 QWEN CLEAN ONLY
+# 🔹 QWEN RESTRUCTURE (SECONDARY)
+# =========================
+def restructure_with_qwen(lines):
+    qwen = None
+    try:
+        qwen = load_qwen()
+
+        text = "\n".join(lines)
+
+        prompt = f"""
+Rearrange text into better natural line breaks.
+
+Rules:
+- Keep same meaning
+- Do NOT add content
+- Keep similar number of lines
+- No explanations
+
+{text}
+"""
+
+        sampling = SamplingParams(temperature=0, max_tokens=512)
+        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
+
+        new_lines = [l.strip() for l in result.split("\n") if l.strip()]
+
+        return new_lines if new_lines else lines
+
+    except Exception as e:
+        print("⚠️ Qwen restructure error:", e)
+        return lines
+
+    finally:
+        if qwen:
+            del qwen
+        clear_gpu()
+
+# =========================
+# 🔹 QWEN CLEAN (FINAL)
 # =========================
 def clean_with_qwen(lines):
-    qwen_llm = None
+    qwen = None
     try:
-        qwen_llm = load_qwen()
+        qwen = load_qwen()
 
         text = "\n".join(lines)
 
@@ -119,29 +155,37 @@ Fix spacing and broken words ONLY.
 
 Rules:
 - Do NOT change meaning
-- Do NOT add anything
-- Do NOT repeat prompt
-- Output same lines
+- Do NOT add content
+- Keep same number of lines
 
 {text}
 """
 
         sampling = SamplingParams(temperature=0, max_tokens=512)
-        outputs = qwen_llm.generate([prompt], sampling)
+        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
 
-        result = outputs[0].outputs[0].text.strip()
-        cleaned = [l.strip() for l in result.split("\n") if l.strip()]
+        cleaned = [l.strip() for l in result.split("\n")]
+
+        if len(cleaned) != len(lines):
+            return lines
 
         return cleaned
 
     except Exception as e:
-        print("⚠️ Qwen error:", e)
+        print("⚠️ Qwen clean error:", e)
         return lines
 
     finally:
-        if qwen_llm:
-            del qwen_llm
+        if qwen:
+            del qwen
         clear_gpu()
+
+# =========================
+# 🔹 HEALTH
+# =========================
+@app.get("/health")
+def health():
+    return {"status": "running"}
 
 # =========================
 # 🔹 MAIN API
@@ -153,13 +197,13 @@ async def similarity(
     answer_sheets: List[UploadFile] = File(...)
 ):
     try:
-        print("\n🚀 New request received")
+        print("\n🚀 New request")
 
         questions_data = json.loads(questions)
         results = []
 
-        # 🔥 Load Uni-MuMER
-        unimer_llm, unimer_sampling = load_unimer()
+        # 🔥 Load Uni-MuMER ONCE
+        unimer, sampling = load_unimer()
 
         for sheet_idx, sheet in enumerate(answer_sheets):
 
@@ -169,21 +213,23 @@ async def similarity(
             sheet_dir = f"output/sheet_{sheet_idx}"
             os.makedirs(sheet_dir, exist_ok=True)
 
-            page_line_counts = []
+            raw_text = ""
 
+            # =========================
+            # 🔹 PROCESS PAGES
+            # =========================
             for img in images:
                 arr = np.array(img.convert("RGB"))
 
-                count, _ = segment_lines_and_find_diagrams(
+                segment_lines_and_find_diagrams(
                     arr,
                     output_folder=sheet_dir,
-                    llm=unimer_llm,
-                    sampling_params=unimer_sampling,
+                    llm=unimer,
+                    sampling_params=sampling,
                 )
-                page_line_counts.append(count)
 
             # 🔥 FREE Uni-MuMER
-            del unimer_llm
+            del unimer
             clear_gpu()
 
             # =========================
@@ -191,40 +237,35 @@ async def similarity(
             # =========================
             latex_file = f"{sheet_dir}/formulas_latex.json"
 
-            raw_text = ""
             if os.path.exists(latex_file):
                 data = json.load(open(latex_file))
-
                 for v in data.values():
-                    if v:
-                        raw_text += " " + clean_unimumer_output(v)
+                    raw_text += " " + clean_unimumer_output(v)
 
             # =========================
-            # 🔹 OCR LINE COUNT (CLAMPED)
+            # 🔹 OCR LINE COUNT ONLY
             # =========================
             ocr_counts = []
 
-            for f in os.listdir(f"{sheet_dir}/texts"):
-                with open(f"{sheet_dir}/texts/{f}", "rb") as file:
-                    txt = ocr_from_image(file.read())
-                    if txt.strip():
-                        ocr_counts.append(len(txt.split("\n")))
+            text_folder = f"{sheet_dir}/texts"
+            if os.path.exists(text_folder):
+                for f in os.listdir(text_folder):
+                    with open(f"{text_folder}/{f}", "rb") as file:
+                        txt = ocr_from_image(file.read())
+                        if txt.strip():
+                            ocr_counts.append(len(txt.split("\n")))
 
-            ocr_lines = max(ocr_counts) if ocr_counts else 3
+            final_lines = max(ocr_counts) if ocr_counts else 3
+            final_lines = min(max(final_lines, 2), 12)
 
-            # 🔥 CRITICAL FIX
-            ocr_lines = min(max(ocr_lines, 2), 12)
-
-            print(f"📊 Final line count used: {ocr_lines}")
-
-            # =========================
-            # 🔹 SPLIT TEXT
-            # =========================
-            structured_lines = split_into_lines(raw_text, ocr_lines)
+            print(f"📊 OCR line count: {final_lines}")
 
             # =========================
-            # 🔹 CLEAN WITH QWEN
+            # 🔹 STRUCTURE + CLEAN
             # =========================
+            structured_lines = split_into_lines(raw_text, final_lines)
+
+            structured_lines = restructure_with_qwen(structured_lines)
             structured_lines = clean_with_qwen(structured_lines)
 
             # =========================
