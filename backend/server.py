@@ -28,7 +28,14 @@ app.add_middleware(
 sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
-QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct" 
+QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
+
+# =========================
+# 🔹 GLOBAL MODELS (🔥 KEY FIX)
+# =========================
+unimer = None
+unimer_sampling = None
+qwen = None
 
 # =========================
 # 🔹 GPU CLEAN
@@ -45,74 +52,83 @@ def clear_gpu():
 # 🔹 LOADERS
 # =========================
 def load_unimer():
-    print("🔄 Loading Uni-MuMER...")
-    llm = LLM(
-        model=UNIMER_MODEL_PATH,
-        trust_remote_code=True,
-        dtype="float16",
-        gpu_memory_utilization=0.90,
-        max_model_len=2048
-    )
-    print("✅ Uni-MuMER loaded")
-    return llm, SamplingParams(temperature=0, max_tokens=512)
+    global unimer, unimer_sampling
+    if unimer is None:
+        print("🔄 Loading Uni-MuMER...")
+        unimer = LLM(
+            model=UNIMER_MODEL_PATH,
+            trust_remote_code=True,
+            dtype="float16",
+            gpu_memory_utilization=0.85,
+            max_model_len=2048
+        )
+        unimer_sampling = SamplingParams(temperature=0, max_tokens=512)
+        print("✅ Uni-MuMER loaded")
 
 def load_qwen():
-    print("🔄 Loading Qwen...")
-    llm = LLM(
-        model=QWEN_MODEL_PATH,
-        trust_remote_code=True,
-        dtype="float16",
-        gpu_memory_utilization=0.50,
-        max_model_len=1024
-    )
-    print("✅ Qwen loaded")
-    return llm
+    global qwen
+    if qwen is None:
+        print("🔄 Loading Qwen...")
+        qwen = LLM(
+            model=QWEN_MODEL_PATH,
+            trust_remote_code=True,
+            dtype="float16",
+            gpu_memory_utilization=0.45,
+            max_model_len=1024
+        )
+        print("✅ Qwen loaded")
 
 # =========================
-# 🔹 STRONG CLEAN Uni-MuMER TEXT
+# 🔹 STARTUP LOAD (🔥 HUGE SPEED BOOST)
+# =========================
+@app.on_event("startup")
+def startup_event():
+    load_unimer()
+    load_qwen()
+
+# =========================
+# 🔹 CLEAN Uni-MuMER TEXT
 # =========================
 def clean_unimumer_output(text):
     if not text:
         return ""
 
-    # merge spaced letters (VERY IMPORTANT FIX)
+    # strong merge spaced letters
     text = re.sub(
-        r'(?<!\S)(?:[A-Za-z]\s){2,}[A-Za-z](?!\S)',
+        r'(?:(?<=\s)|^)([A-Za-z])(?:\s+[A-Za-z])+(?=\s|$)',
         lambda m: m.group(0).replace(" ", ""),
         text
     )
 
-    # normalize spacing
     text = re.sub(r'\s+', ' ', text)
     text = text.replace(" .", ".").replace(" ,", ",")
 
     return text.strip()
 
 # =========================
-# 🔹 ROBUST OCR LINE COUNT
+# 🔹 OCR LINE COUNT
 # =========================
 def get_clean_line_count(ocr_counts):
     if not ocr_counts:
         return 3
 
-    # remove noisy small detections
     filtered = [c for c in ocr_counts if c >= 5]
-
     if not filtered:
         filtered = ocr_counts
 
     filtered.sort()
     mid = len(filtered) // 2
 
-    if len(filtered) % 2 == 0:
-        median = (filtered[mid - 1] + filtered[mid]) // 2
-    else:
-        median = filtered[mid]
+    median = (
+        (filtered[mid - 1] + filtered[mid]) // 2
+        if len(filtered) % 2 == 0
+        else filtered[mid]
+    )
 
     return max(3, min(median, 25))
 
 # =========================
-# 🔹 PYTHON SPLIT (PRIMARY STRUCTURE)
+# 🔹 SPLIT TEXT
 # =========================
 def split_into_lines(text, n_lines):
     words = text.split()
@@ -130,13 +146,10 @@ def split_into_lines(text, n_lines):
     return lines
 
 # =========================
-# 🔹 QWEN RESTRUCTURE
+# 🔹 QWEN RESTRUCTURE (ONLY ONE PASS)
 # =========================
 def restructure_with_qwen(lines):
-    qwen = None
     try:
-        qwen = load_qwen()
-
         text = "\n".join(lines)
 
         prompt = f"""
@@ -160,53 +173,8 @@ Rules:
         return new_lines if new_lines else lines
 
     except Exception as e:
-        print("⚠️ Qwen restructure error:", e)
+        print("⚠️ Qwen error:", e)
         return lines
-
-    finally:
-        if qwen:
-            del qwen
-        clear_gpu()
-
-# =========================
-# 🔹 QWEN FINAL CLEAN
-# =========================
-def clean_with_qwen(lines):
-    qwen = None
-    try:
-        qwen = load_qwen()
-
-        text = "\n".join(lines)
-
-        prompt = f"""
-Fix spacing and broken words ONLY.
-
-Rules:
-- Do NOT change meaning
-- Do NOT add content
-- Keep SAME number of lines
-
-{text}
-"""
-
-        sampling = SamplingParams(temperature=0, max_tokens=512)
-        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
-
-        cleaned = [l.strip() for l in result.split("\n")]
-
-        if len(cleaned) != len(lines):
-            return lines
-
-        return cleaned
-
-    except Exception as e:
-        print("⚠️ Qwen clean error:", e)
-        return lines
-
-    finally:
-        if qwen:
-            del qwen
-        clear_gpu()
 
 # =========================
 # 🔹 HEALTH
@@ -230,9 +198,6 @@ async def similarity(
         questions_data = json.loads(questions)
         results = []
 
-        # 🔥 Load Uni-MuMER ONCE
-        unimer, sampling = load_unimer()
-
         for sheet_idx, sheet in enumerate(answer_sheets):
 
             content = await sheet.read()
@@ -244,7 +209,7 @@ async def similarity(
             raw_text = ""
 
             # =========================
-            # 🔹 PROCESS PAGES
+            # 🔹 PROCESS IMAGES
             # =========================
             for img in images:
                 arr = np.array(img.convert("RGB"))
@@ -253,15 +218,11 @@ async def similarity(
                     arr,
                     output_folder=sheet_dir,
                     llm=unimer,
-                    sampling_params=sampling,
+                    sampling_params=unimer_sampling,
                 )
 
-            # 🔥 FREE Uni-MuMER
-            del unimer
-            clear_gpu()
-
             # =========================
-            # 🔹 READ Uni-MuMER OUTPUT
+            # 🔹 READ OUTPUT
             # =========================
             latex_file = f"{sheet_dir}/formulas_latex.json"
 
@@ -289,11 +250,10 @@ async def similarity(
             print(f"📊 Final line count: {final_lines}")
 
             # =========================
-            # 🔹 STRUCTURE PIPELINE
+            # 🔹 STRUCTURE
             # =========================
             structured_lines = split_into_lines(raw_text, final_lines)
             structured_lines = restructure_with_qwen(structured_lines)
-            structured_lines = clean_with_qwen(structured_lines)
 
             # =========================
             # 🔹 SCORING
