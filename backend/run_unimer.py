@@ -1,6 +1,6 @@
 """
-Subprocess worker: loads Uni-MuMER, processes all page images, writes output to a JSON file.
-Called by server.py via multiprocessing. Exits when done — fully releasing GPU memory.
+Subprocess worker: loads Uni-MuMER, processes all page images, writes output JSON.
+Called by server.py via subprocess.run(). Exits when done — fully releasing GPU memory.
 
 Args (via sys.argv):
     1: path to input JSON  {"pages": ["page_0.png", ...], "sheet_dir": "..."}
@@ -19,6 +19,7 @@ UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
 def clean_unimumer_output(text: str) -> str:
     if not text:
         return text
+    # Merge spaced-out single chars: "G r a d i e n t" → "Gradient"
     text = re.sub(
         r'(?<!\S)((?:[A-Za-z] )+[A-Za-z])(?!\S)',
         lambda m: m.group(0).replace(' ', ''),
@@ -65,7 +66,6 @@ def main():
         page_line_counts.append(count)
         print(f"📄 Page {page_idx+1}: Uni-MuMER lines={count}")
 
-    # Read formulas_latex.json written by segment_lines_and_find_diagrams
     raw_parts = []
     latex_file = os.path.join(sheet_dir, "formulas_latex.json")
 
