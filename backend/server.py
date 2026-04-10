@@ -12,9 +12,6 @@ from typing import List
 import torch
 from vllm import LLM, SamplingParams
 
-# 🔥 Prevent fragmentation (VERY IMPORTANT)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 # =========================
 # 🔹 APP INIT
 # =========================
@@ -55,7 +52,7 @@ def load_unimer():
         dtype="float16",
         gpu_memory_utilization=0.90,
         max_model_len=2048,
-        enforce_eager=True
+        enforce_eager=True   # 🔥 prevents CUDA graph memory issues
     )
     print("✅ Uni-MuMER loaded")
     return llm, SamplingParams(temperature=0, max_tokens=512)
@@ -68,7 +65,7 @@ def load_qwen():
         dtype="float16",
         gpu_memory_utilization=0.50,
         max_model_len=1024,
-        enforce_eager=True
+        enforce_eager=True   # 🔥 stability over speed
     )
     print("✅ Qwen loaded")
     return llm
@@ -108,9 +105,7 @@ def get_clean_line_count(ocr_counts):
     if len(filtered) % 2 == 0:
         median = (filtered[mid - 1] + filtered[mid]) // 2
     else:
-        median = filtered[mid
-
-        ]
+        median = filtered[mid]
 
     return max(3, min(median, 25))
 
@@ -133,35 +128,13 @@ def split_into_lines(text, n_lines):
     return lines
 
 # =========================
-# 🔹 QWEN PIPELINE (LOAD → USE → DELETE)
-# =========================
-def run_qwen(prompt):
-    qwen = None
-    try:
-        clear_gpu()
-        qwen = load_qwen()
-
-        sampling = SamplingParams(temperature=0, max_tokens=512)
-        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
-
-        return result
-
-    except Exception as e:
-        print("⚠️ Qwen error:", e)
-        return ""
-
-    finally:
-        if qwen:
-            del qwen
-        clear_gpu()
-
-# =========================
 # 🔹 QWEN RESTRUCTURE
 # =========================
-def restructure_with_qwen(lines):
-    text = "\n".join(lines)
+def restructure_with_qwen(lines, qwen_llm):
+    try:
+        text = "\n".join(lines)
 
-    prompt = f"""
+        prompt = f"""
 Rearrange text into natural handwritten-style lines.
 
 Rules:
@@ -174,18 +147,24 @@ Rules:
 {text}
 """
 
-    result = run_qwen(prompt)
-    new_lines = [l.strip() for l in result.split("\n") if l.strip()]
+        sampling = SamplingParams(temperature=0, max_tokens=512)
+        result = qwen_llm.generate([prompt], sampling)[0].outputs[0].text.strip()
 
-    return new_lines if new_lines else lines
+        new_lines = [l.strip() for l in result.split("\n") if l.strip()]
+        return new_lines if new_lines else lines
+
+    except Exception as e:
+        print("⚠️ Qwen restructure error:", e)
+        return lines
 
 # =========================
 # 🔹 QWEN CLEAN
 # =========================
-def clean_with_qwen(lines):
-    text = "\n".join(lines)
+def clean_with_qwen(lines, qwen_llm):
+    try:
+        text = "\n".join(lines)
 
-    prompt = f"""
+        prompt = f"""
 Fix spacing and broken words ONLY.
 
 Rules:
@@ -196,13 +175,19 @@ Rules:
 {text}
 """
 
-    result = run_qwen(prompt)
-    cleaned = [l.strip() for l in result.split("\n")]
+        sampling = SamplingParams(temperature=0, max_tokens=512)
+        result = qwen_llm.generate([prompt], sampling)[0].outputs[0].text.strip()
 
-    if len(cleaned) != len(lines):
+        cleaned = [l.strip() for l in result.split("\n")]
+
+        if len(cleaned) != len(lines):
+            return lines
+
+        return cleaned
+
+    except Exception as e:
+        print("⚠️ Qwen clean error:", e)
         return lines
-
-    return cleaned
 
 # =========================
 # 🔹 HEALTH
@@ -226,8 +211,9 @@ async def similarity(
         questions_data = json.loads(questions)
         results = []
 
-        # 🔥 LOAD Uni-MuMER ONLY HERE
-        clear_gpu()
+        # =========================
+        # 🔹 LOAD UNIMER
+        # =========================
         unimer_llm, unimer_sampling = load_unimer()
 
         for sheet_idx, sheet in enumerate(answer_sheets):
@@ -240,6 +226,9 @@ async def similarity(
 
             raw_text = ""
 
+            # =========================
+            # 🔹 PROCESS PAGES
+            # =========================
             for img in images:
                 arr = np.array(img.convert("RGB"))
 
@@ -250,68 +239,75 @@ async def similarity(
                     sampling_params=unimer_sampling,
                 )
 
-            # 🔥 FREE Uni-MuMER BEFORE QWEN
-            del unimer_llm
-            clear_gpu()
+        # 🔥 UNLOAD UNIMER ASAP
+        del unimer_llm
+        clear_gpu()
 
-            # =========================
-            # 🔹 READ OUTPUT
-            # =========================
-            latex_file = f"{sheet_dir}/formulas_latex.json"
+        # =========================
+        # 🔹 READ OUTPUT
+        # =========================
+        latex_file = f"{sheet_dir}/formulas_latex.json"
 
-            if os.path.exists(latex_file):
-                data = json.load(open(latex_file))
-                for v in data.values():
-                    raw_text += " " + clean_unimumer_output(v)
+        if os.path.exists(latex_file):
+            data = json.load(open(latex_file))
+            for v in data.values():
+                raw_text += " " + clean_unimumer_output(v)
 
-            # =========================
-            # 🔹 OCR COUNT
-            # =========================
-            ocr_counts = []
+        # =========================
+        # 🔹 OCR COUNT
+        # =========================
+        ocr_counts = []
 
-            text_folder = f"{sheet_dir}/texts"
-            if os.path.exists(text_folder):
-                for f in os.listdir(text_folder):
-                    with open(f"{text_folder}/{f}", "rb") as file:
-                        txt = ocr_from_image(file.read())
-                        if txt.strip():
-                            ocr_counts.append(len(txt.split("\n")))
+        text_folder = f"{sheet_dir}/texts"
+        if os.path.exists(text_folder):
+            for f in os.listdir(text_folder):
+                with open(f"{text_folder}/{f}", "rb") as file:
+                    txt = ocr_from_image(file.read())
+                    if txt.strip():
+                        ocr_counts.append(len(txt.split("\n")))
 
-            final_lines = get_clean_line_count(ocr_counts)
+        final_lines = get_clean_line_count(ocr_counts)
 
-            print(f"📊 OCR counts: {ocr_counts}")
-            print(f"📊 Final line count: {final_lines}")
+        print(f"📊 OCR counts: {ocr_counts}")
+        print(f"📊 Final line count: {final_lines}")
 
-            # =========================
-            # 🔹 QWEN PIPELINE
-            # =========================
-            structured_lines = split_into_lines(raw_text, final_lines)
-            structured_lines = restructure_with_qwen(structured_lines)
-            structured_lines = clean_with_qwen(structured_lines)
+        # =========================
+        # 🔹 LOAD QWEN ONCE
+        # =========================
+        print("🔄 Loading Qwen once...")
+        qwen_llm = load_qwen()
 
-            # =========================
-            # 🔹 SCORING
-            # =========================
-            total = 0
-            max_total = 0
+        structured_lines = split_into_lines(raw_text, final_lines)
+        structured_lines = restructure_with_qwen(structured_lines, qwen_llm)
+        structured_lines = clean_with_qwen(structured_lines, qwen_llm)
 
-            for q in questions_data:
-                sim = 0
-                if q.get("keyAnswer"):
-                    for line in structured_lines:
-                        sim = max(sim, text_similarity(q["keyAnswer"], line))
+        # 🔥 UNLOAD QWEN
+        del qwen_llm
+        clear_gpu()
 
-                marks = q.get("marks", 0)
-                total += sim * marks
-                max_total += marks
+        # =========================
+        # 🔹 SCORING
+        # =========================
+        total = 0
+        max_total = 0
 
-            results.append({
-                "score": round(total, 2),
-                "total": max_total,
-                "lines": structured_lines
-            })
+        for q in questions_data:
+            sim = 0
+            if q.get("keyAnswer"):
+                for line in structured_lines:
+                    sim = max(sim, text_similarity(q["keyAnswer"], line))
 
-            shutil.rmtree(sheet_dir, ignore_errors=True)
+            marks = q.get("marks", 0)
+            total += sim * marks
+            max_total += marks
+
+        results.append({
+            "score": round(total, 2),
+            "total": max_total,
+            "lines": structured_lines
+        })
+
+        shutil.rmtree(sheet_dir, ignore_errors=True)
 
         return results[0]
 
