@@ -12,6 +12,9 @@ from typing import List
 import torch
 from vllm import LLM, SamplingParams
 
+# 🔥 Prevent fragmentation (VERY IMPORTANT)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # =========================
 # 🔹 APP INIT
 # =========================
@@ -29,13 +32,6 @@ sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
 QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
-
-# =========================
-# 🔹 GLOBAL MODELS
-# =========================
-unimer_llm = None
-unimer_sampling = None
-qwen_llm = None
 
 # =========================
 # 🔹 GPU CLEAN
@@ -58,7 +54,8 @@ def load_unimer():
         trust_remote_code=True,
         dtype="float16",
         gpu_memory_utilization=0.90,
-        max_model_len=2048
+        max_model_len=2048,
+        enforce_eager=True
     )
     print("✅ Uni-MuMER loaded")
     return llm, SamplingParams(temperature=0, max_tokens=512)
@@ -70,21 +67,11 @@ def load_qwen():
         trust_remote_code=True,
         dtype="float16",
         gpu_memory_utilization=0.50,
-        max_model_len=1024
+        max_model_len=1024,
+        enforce_eager=True
     )
     print("✅ Qwen loaded")
     return llm
-
-# =========================
-# 🔹 STARTUP LOAD
-# =========================
-@app.on_event("startup")
-def startup_event():
-    global unimer_llm, unimer_sampling, qwen_llm
-
-    clear_gpu()
-    unimer_llm, unimer_sampling = load_unimer()
-    qwen_llm = load_qwen()
 
 # =========================
 # 🔹 CLEAN Uni-MuMER TEXT
@@ -121,7 +108,9 @@ def get_clean_line_count(ocr_counts):
     if len(filtered) % 2 == 0:
         median = (filtered[mid - 1] + filtered[mid]) // 2
     else:
-        median = filtered[mid]
+        median = filtered[mid
+
+        ]
 
     return max(3, min(median, 25))
 
@@ -144,14 +133,35 @@ def split_into_lines(text, n_lines):
     return lines
 
 # =========================
+# 🔹 QWEN PIPELINE (LOAD → USE → DELETE)
+# =========================
+def run_qwen(prompt):
+    qwen = None
+    try:
+        clear_gpu()
+        qwen = load_qwen()
+
+        sampling = SamplingParams(temperature=0, max_tokens=512)
+        result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
+
+        return result
+
+    except Exception as e:
+        print("⚠️ Qwen error:", e)
+        return ""
+
+    finally:
+        if qwen:
+            del qwen
+        clear_gpu()
+
+# =========================
 # 🔹 QWEN RESTRUCTURE
 # =========================
 def restructure_with_qwen(lines):
-    global qwen_llm
-    try:
-        text = "\n".join(lines)
+    text = "\n".join(lines)
 
-        prompt = f"""
+    prompt = f"""
 Rearrange text into natural handwritten-style lines.
 
 Rules:
@@ -164,25 +174,18 @@ Rules:
 {text}
 """
 
-        sampling = SamplingParams(temperature=0, max_tokens=512)
-        result = qwen_llm.generate([prompt], sampling)[0].outputs[0].text.strip()
+    result = run_qwen(prompt)
+    new_lines = [l.strip() for l in result.split("\n") if l.strip()]
 
-        new_lines = [l.strip() for l in result.split("\n") if l.strip()]
-        return new_lines if new_lines else lines
-
-    except Exception as e:
-        print("⚠️ Qwen restructure error:", e)
-        return lines
+    return new_lines if new_lines else lines
 
 # =========================
 # 🔹 QWEN CLEAN
 # =========================
 def clean_with_qwen(lines):
-    global qwen_llm
-    try:
-        text = "\n".join(lines)
+    text = "\n".join(lines)
 
-        prompt = f"""
+    prompt = f"""
 Fix spacing and broken words ONLY.
 
 Rules:
@@ -193,19 +196,13 @@ Rules:
 {text}
 """
 
-        sampling = SamplingParams(temperature=0, max_tokens=512)
-        result = qwen_llm.generate([prompt], sampling)[0].outputs[0].text.strip()
+    result = run_qwen(prompt)
+    cleaned = [l.strip() for l in result.split("\n")]
 
-        cleaned = [l.strip() for l in result.split("\n")]
-
-        if len(cleaned) != len(lines):
-            return lines
-
-        return cleaned
-
-    except Exception as e:
-        print("⚠️ Qwen clean error:", e)
+    if len(cleaned) != len(lines):
         return lines
+
+    return cleaned
 
 # =========================
 # 🔹 HEALTH
@@ -226,10 +223,12 @@ async def similarity(
     try:
         print("\n🚀 New request")
 
-        global unimer_llm, unimer_sampling
-
         questions_data = json.loads(questions)
         results = []
+
+        # 🔥 LOAD Uni-MuMER ONLY HERE
+        clear_gpu()
+        unimer_llm, unimer_sampling = load_unimer()
 
         for sheet_idx, sheet in enumerate(answer_sheets):
 
@@ -241,9 +240,6 @@ async def similarity(
 
             raw_text = ""
 
-            # =========================
-            # 🔹 PROCESS PAGES
-            # =========================
             for img in images:
                 arr = np.array(img.convert("RGB"))
 
@@ -254,8 +250,12 @@ async def similarity(
                     sampling_params=unimer_sampling,
                 )
 
+            # 🔥 FREE Uni-MuMER BEFORE QWEN
+            del unimer_llm
+            clear_gpu()
+
             # =========================
-            # 🔹 READ Uni-MuMER OUTPUT
+            # 🔹 READ OUTPUT
             # =========================
             latex_file = f"{sheet_dir}/formulas_latex.json"
 
@@ -265,7 +265,7 @@ async def similarity(
                     raw_text += " " + clean_unimumer_output(v)
 
             # =========================
-            # 🔹 OCR LINE COUNT
+            # 🔹 OCR COUNT
             # =========================
             ocr_counts = []
 
@@ -283,7 +283,7 @@ async def similarity(
             print(f"📊 Final line count: {final_lines}")
 
             # =========================
-            # 🔹 STRUCTURE PIPELINE
+            # 🔹 QWEN PIPELINE
             # =========================
             structured_lines = split_into_lines(raw_text, final_lines)
             structured_lines = restructure_with_qwen(structured_lines)
