@@ -23,6 +23,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 # =========================
@@ -32,6 +34,15 @@ sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
 QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
+
+# =========================
+# 🔹 GLOBAL MODEL STATE
+# Key idea: Uni-MuMER loads fresh per request (too big to keep alongside Qwen),
+# but Qwen is loaded ONCE after first use and kept alive for all subsequent requests.
+# This avoids the ~40s Qwen reload on every request which was killing ngrok.
+# =========================
+_qwen_llm = None      # persists across requests
+_qwen_sampling = None
 
 # =========================
 # 🔹 GPU CLEAN
@@ -48,10 +59,6 @@ def clear_gpu():
 # 🔹 OCR‑BASED LINE COUNT
 # =========================
 def get_clean_line_count(ocr_counts):
-    """
-    Compute the expected number of lines from a list of OCR line counts.
-    Uses median filtering to ignore outliers (diagrams, empty pages).
-    """
     if not ocr_counts:
         return 3
 
@@ -76,14 +83,14 @@ def clean_unimumer_output(text: str) -> str:
     if not text:
         return text
 
-    # merge spaced characters
+    # merge spaced-out single characters e.g. "G r a d i e n t" → "Gradient"
     text = re.sub(
         r'(?<!\S)((?:[A-Za-z] )+[A-Za-z])(?!\S)',
         lambda m: m.group(0).replace(' ', ''),
         text
     )
 
-    # fix spacing issues
+    # fix missing spaces between camelCase-merged words
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
     text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
     text = re.sub(r'(\d)\.', r'\1. ', text)
@@ -93,7 +100,7 @@ def clean_unimumer_output(text: str) -> str:
     return text.strip()
 
 # =========================
-# 🔹 LOAD Uni-MuMER
+# 🔹 LOAD Uni-MuMER (per-request, unloaded before Qwen)
 # =========================
 def load_unimer():
     print("🔄 Loading Uni-MuMER...")
@@ -108,62 +115,65 @@ def load_unimer():
     return llm, SamplingParams(temperature=0, max_tokens=512)
 
 # =========================
-# 🔹 LOAD QWEN
+# 🔹 GET QWEN (singleton — loads once, stays alive)
 # =========================
-def load_qwen():
-    print("🔄 Loading Qwen...")
-    llm = LLM(
-        model=QWEN_MODEL_PATH,
-        trust_remote_code=True,
-        dtype="float16",
-        gpu_memory_utilization=0.75,
-        max_model_len=1024,
-    )
-    print("✅ Qwen loaded")
-    return llm
+def get_qwen():
+    global _qwen_llm, _qwen_sampling
+    if _qwen_llm is None:
+        print("🔄 Loading Qwen (first time)...")
+        _qwen_llm = LLM(
+            model=QWEN_MODEL_PATH,
+            trust_remote_code=True,
+            dtype="float16",
+            gpu_memory_utilization=0.75,
+            max_model_len=1024,
+        )
+        _qwen_sampling = SamplingParams(temperature=0, max_tokens=1024)
+        print("✅ Qwen loaded and cached")
+    else:
+        print("✅ Qwen already loaded, reusing")
+    return _qwen_llm, _qwen_sampling
 
 # =========================
-# 🔹 QWEN CLEANING ONLY
+# 🔹 QWEN CLEANING
+# FIX: use proper chat format so model doesn't echo the prompt back
 # =========================
 def restructure_with_qwen(raw_lines, expected_lines):
     if not raw_lines:
         return []
 
-    qwen = None
     try:
-        qwen = load_qwen()
+        qwen, sampling = get_qwen()
 
         text = "\n".join(raw_lines)
 
-        prompt = f"""
-You are an OCR post-processor.
+        # Use chat-style formatting with clear system/user separation.
+        # The previous single-block prompt caused the model to echo instructions.
+        # With chat format, the model only sees "assistant turn starts here" and fills it.
+        system_msg = (
+            "You are an OCR post-processor. "
+            "Fix spacing and broken words in the input text. "
+            "Output ONLY the fixed text. "
+            "Do NOT repeat instructions, rules, labels, or any explanation. "
+            "Do NOT add new content. "
+            "Preserve the original meaning exactly."
+        )
 
-TASK:
-Fix spacing and broken words in the text.
+        user_msg = f"Fix the spacing in this OCR output:\n\n{text}"
 
-STRICT RULES:
-- Do NOT add new content
-- Do NOT explain anything
-- Do NOT repeat the prompt
-- Do NOT include words like "RULES", "Answer", etc.
-- Keep SAME number of lines: {expected_lines}
-- Preserve original meaning exactly
+        # vLLM chat template format
+        prompt = f"<|im_start|>system\n{system_msg}<|im_end|>\n<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n"
 
-INPUT:
-{text}
-
-OUTPUT (only cleaned text):
-"""
-
-        sampling = SamplingParams(temperature=0, max_tokens=1024)
         result = qwen.generate([prompt], sampling)[0].outputs[0].text.strip()
+
+        # Strip any trailing <|im_end|> tokens vLLM may leave
+        result = result.replace("<|im_end|>", "").strip()
 
         lines = [l.strip() for l in result.split("\n") if l.strip()]
 
-        # enforce exact line count
+        # Enforce line count
         if len(lines) > expected_lines:
             lines = lines[:expected_lines]
-
         while len(lines) < expected_lines:
             lines.append("")
 
@@ -178,14 +188,10 @@ OUTPUT (only cleaned text):
 
     except Exception as e:
         print("⚠️ Qwen error:", e)
+        traceback.print_exc()
         return raw_lines
 
-    finally:
-        try:
-            del qwen
-        except:
-            pass
-        clear_gpu()
+    # ✅ Do NOT del qwen here — we want it to stay alive for next request
 
 # =========================
 # 🔹 HEALTH
@@ -215,7 +221,7 @@ async def similarity(
 
         for sheet_idx, sheet in enumerate(answer_sheets):
 
-            # 🔥 LOAD Uni-MuMER
+            # 🔥 Load Uni-MuMER fresh for this sheet
             unimer, sampling = load_unimer()
 
             content = await sheet.read()
@@ -225,8 +231,9 @@ async def similarity(
             os.makedirs(sheet_dir, exist_ok=True)
 
             raw_lines = []
+            ocr_counts = []
 
-            # 🔹 Process each page with Uni-MuMER
+            # 🔹 Process each page with Uni-MuMER + OCR line count
             for page_idx, img in enumerate(images):
                 arr = np.array(img.convert("RGB"))
 
@@ -236,8 +243,10 @@ async def similarity(
                     llm=unimer,
                     sampling_params=sampling,
                 )
-
                 print(f"📄 Page {page_idx+1}: Uni-MuMER lines={count}")
+
+                # OCR line count collected per page image here
+                # (kept same logic as original — reads from texts/ folder below)
 
             # 🔹 Read Uni-MuMER output
             latex_file = os.path.join(sheet_dir, "formulas_latex.json")
@@ -257,12 +266,12 @@ async def similarity(
 
                 print("==============================\n")
 
-            # 🔥 UNLOAD Uni-MuMER BEFORE OCR (free memory)
+            # 🔥 UNLOAD Uni-MuMER before loading Qwen (free ~7GB)
             del unimer
             clear_gpu()
+            print("🗑️ Uni-MuMER unloaded, GPU freed")
 
-            # 🔹 OCR‑BASED LINE COUNT (NEW!)
-            ocr_counts = []
+            # 🔹 OCR-based line count
             text_folder = os.path.join(sheet_dir, "texts")
             if os.path.exists(text_folder):
                 for filename in os.listdir(text_folder):
@@ -277,7 +286,7 @@ async def similarity(
             print(f"📊 OCR line counts per image: {ocr_counts}")
             print(f"📊 Final expected lines: {expected_lines}")
 
-            # 🔥 Qwen cleaning (loads Qwen on demand)
+            # 🔥 Qwen cleaning (singleton — fast after first load)
             structured_lines = restructure_with_qwen(raw_lines, expected_lines)
 
             # 🔹 Scoring
