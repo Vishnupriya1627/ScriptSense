@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pdf2image import convert_from_bytes
 
 import numpy as np
-import os, sys, json, shutil, traceback, re
+import os, sys, json, shutil, traceback, re, gc
 from typing import List
 from PIL import Image
 
@@ -41,36 +41,60 @@ _qwen_sampling   = None
 _unimer_llm      = None
 _unimer_sampling = None
 
+def unload_unimer():
+    global _unimer_llm, _unimer_sampling
+    if _unimer_llm is not None:
+        print("🗑️ Unloading Uni-MuMER from GPU...")
+        del _unimer_llm
+        _unimer_llm = None
+        _unimer_sampling = None
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("✅ Uni-MuMER unloaded")
+
+def unload_qwen():
+    global _qwen_llm, _qwen_sampling
+    if _qwen_llm is not None:
+        print("🗑️ Unloading Qwen from GPU...")
+        del _qwen_llm
+        _qwen_llm = None
+        _qwen_sampling = None
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("✅ Qwen unloaded")
+
 def get_unimer():
     global _unimer_llm, _unimer_sampling
+    unload_qwen()  # free GPU before loading
     if _unimer_llm is None:
         print("🔄 Loading Uni-MuMER...")
         _unimer_llm = LLM(
             model=UNIMER_MODEL_PATH,
             trust_remote_code=True,
             dtype="float16",
-            gpu_memory_utilization=0.45,
+            gpu_memory_utilization=0.90,
             max_model_len=4096,
         )
         _unimer_sampling = SamplingParams(temperature=0, max_tokens=4096)
-        print("✅ Uni-MuMER loaded and cached")
+        print("✅ Uni-MuMER loaded")
     else:
         print("✅ Uni-MuMER already loaded, reusing")
     return _unimer_llm, _unimer_sampling
 
 def get_qwen():
     global _qwen_llm, _qwen_sampling
+    unload_unimer()  # free GPU before loading
     if _qwen_llm is None:
         print("🔄 Loading Qwen...")
         _qwen_llm = LLM(
             model=QWEN_MODEL_PATH,
             trust_remote_code=True,
             dtype="float16",
-            gpu_memory_utilization=0.45,
+            gpu_memory_utilization=0.90,
             max_model_len=2048,
         )
         _qwen_sampling = SamplingParams(temperature=0, max_tokens=2048)
-        print("✅ Qwen loaded and cached")
+        print("✅ Qwen loaded")
     else:
         print("✅ Qwen already loaded, reusing")
     return _qwen_llm, _qwen_sampling
@@ -80,28 +104,30 @@ def get_qwen():
 # =========================
 def clean_unimumer_output(text: str) -> str:
     """Merge spaced-out single characters while preserving LaTeX."""
-    import re
-    # protect LaTeX blocks
     latex_blocks = {}
+
     def protect(m):
         key = f"__LATEX{len(latex_blocks)}__"
         latex_blocks[key] = m.group(0)
         return key
+
     text = re.sub(r'\$[^$]+\$', protect, text)
     text = re.sub(r'\\[a-zA-Z]+\{[^}]*\}', protect, text)
-
-    # merge spaced single chars: "G r a d i e n t" -> "Gradient"
-    text = re.sub(r'\b([A-Za-z])(( [A-Za-z])+)\b', lambda m: (m.group(1) + m.group(2)).replace(" ", ""), text)
-
-    # restore LaTeX
+    text = re.sub(
+        r'\b([A-Za-z])(( [A-Za-z])+)\b',
+        lambda m: (m.group(1) + m.group(2)).replace(" ", ""),
+        text
+    )
     for key, val in latex_blocks.items():
         text = text.replace(key, val)
     return text
 
 def run_unimer_on_images(images: list) -> dict:
     from qwen_vl_utils import process_vision_info
+    from transformers import AutoProcessor
 
     llm, sampling = get_unimer()
+    processor = AutoProcessor.from_pretrained(UNIMER_MODEL_PATH, trust_remote_code=True)
 
     all_lines = []
     for page_idx, img in enumerate(images):
@@ -124,8 +150,6 @@ def run_unimer_on_images(images: list) -> dict:
             ]
         }]
 
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(UNIMER_MODEL_PATH, trust_remote_code=True)
         prompt_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
 
@@ -140,7 +164,7 @@ def run_unimer_on_images(images: list) -> dict:
         os.unlink(tmp_path)
 
         lines = [l.strip() for l in output.split('\n') if l.strip()]
-        for line_idx, line in enumerate(lines):
+        for line in lines:
             all_lines.append(f"Line {len(all_lines)+1}: {line}")
             print(f"Line {len(all_lines)}: {line}")
 
@@ -337,13 +361,13 @@ async def similarity(
             content = await sheet.read()
             images  = convert_from_bytes(content)
 
-            # ── STAGE 1: Uni-MuMER (in-process, no subprocess) ──────────────
+            # ── STAGE 1: Uni-MuMER (in-process, Qwen unloaded first) ────────
             print("🔍 Running Uni-MuMER inference...")
             unimer_result = run_unimer_on_images(images)
             raw_text      = unimer_result.get("raw_text", "")
             print(f"\n📝 Raw blob ({len(raw_text)} chars): {raw_text[:300]}\n")
 
-            # ── STAGE 2: Qwen Pass 1 — clean text ───────────────────────────
+            # ── STAGE 2: Qwen Pass 1 — clean text (Uni-MuMER unloaded first) ─
             print("🧠 Qwen Pass 1: Cleaning OCR text...")
             cleaned_text = qwen_clean_text(raw_text)
             student_answer_lines = wrap_into_lines(cleaned_text, words_per_line=8)
