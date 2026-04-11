@@ -212,7 +212,7 @@ export default function Home() {
     try {
       console.log("🚀 Sending request to backend...");
       const response = await axios.post(
-        " https://mackenzie-unfilterable-kirby.ngrok-free.dev/similarity",
+        "https://mackenzie-unfilterable-kirby.ngrok-free.dev/similarity",
         formData,
         {
           headers: {

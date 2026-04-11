@@ -10,7 +10,7 @@ export default function LoginPage(){
 
     const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
         e.preventDefault();
-        if(username === 'admin@rait.ac.in' && password === 'admin'){
+        if(username === 'admin@gmail.com' && password === 'admin'){
             localStorage.setItem('username', username);
             localStorage.setItem('password', password);
             navigate('/home');
