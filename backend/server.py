@@ -31,7 +31,7 @@ app.add_middleware(
 sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
-QWEN_MODEL_PATH   = "/content/drive/MyDrive/models/Qwen2.5-3B-Instruct"
+QWEN_MODEL_PATH   = "/content/models/Qwen2.5-3B-Instruct"
 
 # =========================
 # 🔹 GLOBAL MODEL STATE
@@ -65,7 +65,7 @@ def unload_qwen():
 
 def get_unimer():
     global _unimer_llm, _unimer_sampling
-    unload_qwen()  # free GPU before loading
+    unload_qwen()
     if _unimer_llm is None:
         print("🔄 Loading Uni-MuMER...")
         _unimer_llm = LLM(
@@ -83,7 +83,7 @@ def get_unimer():
 
 def get_qwen():
     global _qwen_llm, _qwen_sampling
-    unload_unimer()  # free GPU before loading
+    unload_unimer()
     if _qwen_llm is None:
         print("🔄 Loading Qwen...")
         _qwen_llm = LLM(
@@ -100,10 +100,9 @@ def get_qwen():
     return _qwen_llm, _qwen_sampling
 
 # =========================
-# 🔹 UNI-MuMER INFERENCE (in-process, no subprocess)
+# 🔹 UNI-MuMER INFERENCE
 # =========================
 def clean_unimumer_output(text: str) -> str:
-    """Merge spaced-out single characters while preserving LaTeX."""
     latex_blocks = {}
 
     def protect(m):
@@ -131,7 +130,6 @@ def run_unimer_on_images(images: list) -> dict:
 
     all_lines = []
     for page_idx, img in enumerate(images):
-        # resize to max 800px
         w, h = img.size
         if max(w, h) > 800:
             scale = 800 / max(w, h)
@@ -146,7 +144,7 @@ def run_unimer_on_images(images: list) -> dict:
             "role": "user",
             "content": [
                 {"type": "image", "image": f"file://{tmp_path}"},
-                {"type": "text",  "text": "Read all the text and math formulas in this handwritten image. Output everything you see."}
+                {"type": "text", "text": "Read all the text and math formulas in this handwritten image. Output everything you see."}
             ]
         }]
 
@@ -160,7 +158,6 @@ def run_unimer_on_images(images: list) -> dict:
 
         output = llm.generate([inputs], sampling)[0].outputs[0].text
         output = clean_unimumer_output(output.strip())
-
         os.unlink(tmp_path)
 
         lines = [l.strip() for l in output.split('\n') if l.strip()]
@@ -172,7 +169,7 @@ def run_unimer_on_images(images: list) -> dict:
     return {"raw_text": raw_text, "lines": all_lines}
 
 # =========================
-# 🔹 HELPER: wrap text into lines of ~8 words each
+# 🔹 HELPER
 # =========================
 def wrap_into_lines(text: str, words_per_line: int = 8) -> list:
     words = text.split()
@@ -336,7 +333,7 @@ async def health():
     return {"status": "running"}
 
 # =========================
-# 🔹 MAIN API
+# 🔹 SIMILARITY ENDPOINT
 # =========================
 @app.post("/similarity")
 async def similarity(
@@ -361,22 +358,22 @@ async def similarity(
             content = await sheet.read()
             images  = convert_from_bytes(content)
 
-            # ── STAGE 1: Uni-MuMER (in-process, Qwen unloaded first) ────────
+            # STAGE 1: Uni-MuMER
             print("🔍 Running Uni-MuMER inference...")
             unimer_result = run_unimer_on_images(images)
             raw_text      = unimer_result.get("raw_text", "")
             print(f"\n📝 Raw blob ({len(raw_text)} chars): {raw_text[:300]}\n")
 
-            # ── STAGE 2: Qwen Pass 1 — clean text (Uni-MuMER unloaded first) ─
+            # STAGE 2: Clean text
             print("🧠 Qwen Pass 1: Cleaning OCR text...")
             cleaned_text = qwen_clean_text(raw_text)
             student_answer_lines = wrap_into_lines(cleaned_text, words_per_line=8)
 
-            # ── STAGE 3: Qwen Pass 2 — extract key points ───────────────────
+            # STAGE 3: Extract key points
             print("🧠 Qwen Pass 2: Extracting key points...")
             key_points = qwen_extract_key_points(cleaned_text)
 
-            # ── STAGE 4: Qwen Pass 3 — evaluate ─────────────────────────────
+            # STAGE 4: Evaluate
             print("🧠 Qwen Pass 3: Evaluating against answer key...")
             eval_result = qwen_evaluate(key_points, questions_data)
 
@@ -398,6 +395,112 @@ async def similarity(
             shutil.rmtree(sheet_dir, ignore_errors=True)
 
         return results[0] if results else {"score": 0, "total": 0}
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": str(e)}
+
+# =========================
+# 🔹 ANALYSE ENDPOINT
+# =========================
+@app.post("/analyse")
+async def analyse(request: Request):
+    try:
+        body        = await request.json()
+        key_answer  = body.get("keyAnswer", "")
+        key_points  = body.get("keyPoints", [])
+        score       = body.get("score", 0)
+        total       = body.get("total", 1)
+        remarks     = body.get("remarks", "")
+
+        qwen, sampling = get_qwen()
+
+        student_points_str = (
+            "\n".join(f"- {p}" for p in key_points)
+            if key_points else "(none)"
+        )
+
+        # ── Pass A: Strengths, improvements, suggestions ─────────────────
+        system_a = (
+            "You are an expert exam coach analysing a student's answer. "
+            "Given the key answer and student's key points, produce a JSON object with exactly these keys:\n"
+            '{"strengths": ["..."], "improvements": ["..."], "suggestions": ["..."]}\n'
+            "strengths: 2-3 things the student did well.\n"
+            "improvements: 2-3 specific gaps or missing concepts.\n"
+            "suggestions: 2-3 concrete actionable tips to improve.\n"
+            "ONLY return the JSON object. No extra text."
+        )
+        user_a = (
+            f"Key Answer:\n{key_answer}\n\n"
+            f"Student Key Points:\n{student_points_str}\n\n"
+            f"Score: {score}/{total}\nRemarks: {remarks}"
+        )
+        prompt_a = (
+            f"<|im_start|>system\n{system_a}<|im_end|>\n"
+            f"<|im_start|>user\n{user_a}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+        raw_a = qwen.generate([prompt_a], sampling)[0].outputs[0].text
+        raw_a = raw_a.replace("<|im_end|>", "").strip()
+        raw_a = re.sub(r"```[a-z]*|```", "", raw_a).strip()
+        try:
+            feedback = json.loads(raw_a)
+        except:
+            feedback = {"strengths": [], "improvements": [], "suggestions": []}
+
+        print("\n📋 FEEDBACK:")
+        print(json.dumps(feedback, indent=2))
+
+        # ── Pass B: Bloom's taxonomy ──────────────────────────────────────
+        bloom_levels = ["Remember", "Understand", "Apply", "Analyse", "Evaluate", "Create"]
+        system_b = (
+            "You are an expert in Bloom's Taxonomy. "
+            "Given a key answer and a student's key points, rate TWO things for each Bloom's level "
+            "(Remember, Understand, Apply, Analyse, Evaluate, Create):\n"
+            "1. required: how much this level is required by the key answer (0-100)\n"
+            "2. demonstrated: how much the student demonstrated this level (0-100)\n"
+            "Return ONLY a JSON array of exactly 6 objects in this order:\n"
+            '[{"level":"Remember","required":80,"demonstrated":70}, '
+            '{"level":"Understand","required":70,"demonstrated":60}, '
+            '{"level":"Apply","required":50,"demonstrated":40}, '
+            '{"level":"Analyse","required":30,"demonstrated":20}, '
+            '{"level":"Evaluate","required":20,"demonstrated":10}, '
+            '{"level":"Create","required":10,"demonstrated":5}]\n'
+            "No extra text, no explanation — ONLY the JSON array."
+        )
+        user_b = (
+            f"Key Answer:\n{key_answer}\n\n"
+            f"Student Key Points:\n{student_points_str}"
+        )
+        prompt_b = (
+            f"<|im_start|>system\n{system_b}<|im_end|>\n"
+            f"<|im_start|>user\n{user_b}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+        raw_b = qwen.generate([prompt_b], sampling)[0].outputs[0].text
+        raw_b = raw_b.replace("<|im_end|>", "").strip()
+        raw_b = re.sub(r"```[a-z]*|```", "", raw_b).strip()
+        try:
+            blooms = json.loads(raw_b)
+            if not isinstance(blooms, list) or len(blooms) != 6:
+                raise ValueError("bad blooms")
+        except:
+            blooms = [{"level": l, "required": 0, "demonstrated": 0} for l in bloom_levels]
+
+        print("\n🧠 BLOOMS:")
+        print(json.dumps(blooms, indent=2))
+
+        result = {
+            "strengths":    feedback.get("strengths", []),
+            "improvements": feedback.get("improvements", []),
+            "suggestions":  feedback.get("suggestions", []),
+            "blooms":       blooms,
+        }
+
+        print("\n📊 ANALYSIS COMPLETE")
+        return result
 
     except Exception as e:
         traceback.print_exc()
