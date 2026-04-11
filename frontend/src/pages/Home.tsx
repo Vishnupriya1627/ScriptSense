@@ -60,7 +60,7 @@ export default function Home() {
   const [isSetupComplete, setIsSetupComplete] = useState(false);
   const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
   const [loading, setLoading] = useState(false);
-  const [analysing, setAnalysing] = useState(false);
+  const [analysingIndex, setAnalysingIndex] = useState<number | null>(null);
 
   // ============= SETUP =============
   const handleNumQuestionsSubmit = (e: React.FormEvent) => {
@@ -262,7 +262,7 @@ export default function Home() {
     // if already loaded, just show it
     if (q.analysis) return;
 
-    setAnalysing(true);
+    setAnalysingIndex(index);
     try {
       const response = await axios.post(
         `${BACKEND_URL}/analyse`,
@@ -280,6 +280,8 @@ export default function Home() {
       );
 
       const data = response.data;
+      console.log("✅ Analysis response:", data);
+
       setQuestions((prev) => {
         const updated = [...prev];
         updated[index] = { ...updated[index], analysis: data, analysisOpen: true };
@@ -294,7 +296,7 @@ export default function Home() {
         return updated;
       });
     } finally {
-      setAnalysing(false);
+      setAnalysingIndex(null);
     }
   };
 
@@ -377,7 +379,7 @@ export default function Home() {
   const currentQuestion = questions[currentPage];
 
   return (
-    <div className="w-screen h-screen flex flex-col" style={{ backgroundColor: "#BDE8F5" }}>
+    <div className="w-screen min-h-screen flex flex-col" style={{ backgroundColor: "#BDE8F5" }}>
       {/* HEADER */}
       <div className="h-16 bg-white shadow-sm flex items-center justify-between px-8">
         <h1 className="text-xl font-light" style={{ color: "#0F2854" }}>AutoChecker</h1>
@@ -534,11 +536,11 @@ export default function Home() {
                     {/* Analyse button */}
                     <button
                       onClick={() => performAnalysis(currentPage)}
-                      disabled={analysing}
+                      disabled={analysingIndex === currentPage}
                       className="mt-3 w-full py-2 text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
                       style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}
                     >
-                      {analysing && currentQuestion.analysisOpen
+                      {analysingIndex === currentPage
                         ? "⏳ Analysing..."
                         : currentQuestion.analysisOpen && currentQuestion.analysis
                         ? "▲ Hide Analysis"
