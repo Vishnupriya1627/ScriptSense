@@ -135,7 +135,7 @@ def get_qwen():
             trust_remote_code=True,
             dtype="float16",
             gpu_memory_utilization=0.90,
-            max_model_len=4096,   # increased from 2048 to avoid mid-JSON truncation
+            max_model_len=4096,
         )
         _qwen_sampling = SamplingParams(temperature=0, max_tokens=1024)
         print(f"✅ [MODEL] Qwen loaded in {time.time()-t0:.1f}s.")
@@ -315,7 +315,6 @@ def qwen_extract_key_points(cleaned_text: str) -> list:
 
     qwen, sampling = get_qwen()
 
-    # Prefix forcing: start assistant turn with '[' to guide JSON output
     prompt = (
         "<|im_start|>system\n"
         "You are an exam answer analyser. "
@@ -351,11 +350,6 @@ def qwen_extract_key_points(cleaned_text: str) -> list:
 
 def score_embedding(student_points: list, teacher_points: list,
                     marks: int, threshold: float = EMBEDDING_THRESHOLD) -> float:
-    """
-    For each teacher key point, find the best cosine-similar student key point.
-    Coverage = fraction of teacher points with a match >= threshold.
-    Score    = coverage * marks.
-    """
     if not student_points or not teacher_points:
         print("⚠️  [EMB] Missing student or teacher points — returning 0.")
         return 0.0
@@ -366,10 +360,10 @@ def score_embedding(student_points: list, teacher_points: list,
     print(f"   Threshold      : {threshold}")
 
     embedder  = get_embedder()
-    t_embs    = embedder.encode(teacher_points)             # (T, 384)
-    s_embs    = embedder.encode(student_points)             # (S, 384)
-    sim_mat   = cosine_similarity(s_embs, t_embs)           # (S, T)
-    best      = sim_mat.max(axis=0)                         # (T,) best student match per teacher point
+    t_embs    = embedder.encode(teacher_points)
+    s_embs    = embedder.encode(student_points)
+    sim_mat   = cosine_similarity(s_embs, t_embs)
+    best      = sim_mat.max(axis=0)
 
     covered_count = int((best >= threshold).sum())
     coverage      = covered_count / len(teacher_points)
@@ -379,7 +373,6 @@ def score_embedding(student_points: list, teacher_points: list,
     print(f"   Coverage       : {coverage:.2%}")
     print(f"   Embedding score: {emb_score}/{marks}")
 
-    # Print per-teacher-point detail
     for ti, tp in enumerate(teacher_points):
         best_student = student_points[int(sim_mat[:, ti].argmax())]
         print(f"     TP{ti+1} [{best[ti]:.2f}] '{tp[:60]}' ← '{best_student[:60]}'")
@@ -393,10 +386,6 @@ def score_embedding(student_points: list, teacher_points: list,
 
 def score_llm_ensemble(student_points: list, key_answer: str,
                         marks: int, n_passes: int = ENSEMBLE_PASSES) -> float:
-    """
-    Run Qwen scoring n_passes times with temperature=0.3.
-    Return the median score (self-consistency).
-    """
     print(f"🤖 [LLM] Self-consistency scoring: {n_passes} passes at temperature=0.3...")
     t0 = time.time()
 
@@ -455,10 +444,6 @@ def score_llm_ensemble(student_points: list, key_answer: str,
 def hybrid_score(student_points: list, teacher_points: list,
                  key_answer: str, marks: int,
                  alpha: float = ALPHA) -> dict:
-    """
-    final = alpha * embedding_score + (1 - alpha) * llm_ensemble_score
-    Returns dict with all component scores for transparency.
-    """
     print("━" * 50)
     print(f"⚖️  [HYBRID] Computing hybrid score (α={alpha})...")
 
@@ -480,13 +465,10 @@ def hybrid_score(student_points: list, teacher_points: list,
 
 
 # =========================
-# 🔹 EVALUATE (replaces old qwen_evaluate)
+# 🔹 EVALUATE
 # =========================
 
 def evaluate_with_hybrid(key_points: list, questions_data: list) -> dict:
-    """
-    For each question, extract teacher key points then run hybrid scoring.
-    """
     total_score  = 0.0
     max_total    = 0
     per_question = []
@@ -501,8 +483,6 @@ def evaluate_with_hybrid(key_points: list, questions_data: list) -> dict:
         max_total += marks
 
         print(f"\n  📌 Q{i+1} (max={marks})")
-
-        # Extract teacher key points from the key answer
         print(f"  🔑 [EVAL] Extracting teacher key points for Q{i+1}...")
         teacher_points = qwen_extract_key_points(key_answer)
 
@@ -542,15 +522,6 @@ def evaluate_with_hybrid(key_points: list, questions_data: list) -> dict:
 # =========================
 
 def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
-    """
-    Groups students by answer embedding similarity, generates feedback once
-    per cluster centroid, assigns to all members.
-
-    all_students_data: list of dicts:
-      {key_points: list, cleaned_text: str}
-
-    Returns same list with added 'feedback' key per student.
-    """
     n = len(all_students_data)
     if n == 0:
         return all_students_data
@@ -561,10 +532,10 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
 
     embedder = get_embedder()
     texts    = [s.get("cleaned_text", " ".join(s.get("key_points", []))) for s in all_students_data]
-    embs     = embedder.encode(texts)   # (N, 384)
+    embs     = embedder.encode(texts)
 
     if n == 1:
-        labels   = np.array([0])
+        labels    = np.array([0])
         centroids = embs
     else:
         kmeans    = KMeans(n_clusters=k, random_state=42, n_init=10).fit(embs)
@@ -576,12 +547,13 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
     cluster_feedbacks = {}
     qwen, sampling    = get_qwen()
 
+    bloom_levels = ["Remember", "Understand", "Apply", "Analyse", "Evaluate", "Create"]
+
     for cid in range(k):
         members = [i for i, l in enumerate(labels) if l == cid]
         if not members:
             continue
 
-        # Pick representative closest to centroid
         dists   = [np.linalg.norm(embs[i] - centroids[cid]) for i in members]
         rep_idx = members[int(np.argmin(dists))]
         rep     = all_students_data[rep_idx]
@@ -625,19 +597,26 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
         print(f"     Improvements : {len(feedback['improvements'])} items")
         print(f"     Suggestions  : {len(feedback['suggestions'])} items")
 
-        # ── Pass B: Bloom's Taxonomy ───────────────────────────────────────
-        bloom_levels = ["Remember", "Understand", "Apply", "Analyse", "Evaluate", "Create"]
-
+        # ── Pass B: Bloom's Taxonomy (FIXED) ──────────────────────────────
         prompt_b = (
             "<|im_start|>system\n"
-            "You are an expert in Bloom's Taxonomy. "
-            "Rate each of the 6 Bloom's levels (Remember, Understand, Apply, Analyse, Evaluate, Create). "
-            "For each level rate: required (0-100) and demonstrated (0-100). "
+            "You are an expert in Bloom's Taxonomy for exam evaluation.\n"
+            "For each of the 6 Bloom's levels, do the following:\n"
+            "1. 'required': Does the KEY ANSWER demand this level? Score 0-100.\n"
+            "   - 0   = not needed at all\n"
+            "   - 50  = partially needed\n"
+            "   - 100 = central to the answer\n"
+            "2. 'demonstrated': Did the STUDENT KEY POINTS show this level? Score 0 to 'required' only.\n"
+            "   - demonstrated CANNOT exceed required.\n"
+            "   - If required=0, demonstrated must also be 0.\n"
+            "Be strict. Most answers only strongly require 2-3 levels.\n"
             "Return ONLY a raw JSON array of exactly 6 objects. No prose, no markdown.\n"
-            'Example: [{"level":"Remember","required":80,"demonstrated":70}]'
+            'Format: [{"level":"Remember","required":80,"demonstrated":60}]'
             "<|im_end|>\n"
-            f"<|im_start|>user\nKey Answer:\n{key_answer}\n\n"
-            f"Student Key Points:\n{student_str}<|im_end|>\n"
+            f"<|im_start|>user\n"
+            f"Key Answer:\n{key_answer}\n\n"
+            f"Student Key Points:\n{student_str}\n"
+            "<|im_end|>\n"
             "<|im_start|>assistant\n["
         )
 
@@ -649,17 +628,19 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
             print(f"  ⚠️  [CLUSTER] Bloom's JSON parse failed for cluster {cid} — using zeros.")
             blooms = [{"level": l, "required": 0, "demonstrated": 0} for l in bloom_levels]
         else:
-            # Normalise: ensure all 6 levels present, values clamped 0-100
             blooms_map = {b.get("level"): b for b in blooms if isinstance(b, dict)}
             blooms = []
             for level in bloom_levels:
                 entry = blooms_map.get(level, {})
+                # 🔹 FIX: demonstrated is capped at required
+                req = max(0, min(100, int(entry.get("required", 0))))
+                dem = max(0, min(req, int(entry.get("demonstrated", 0))))
                 blooms.append({
                     "level":        level,
-                    "required":     max(0, min(100, int(entry.get("required", 0)))),
-                    "demonstrated": max(0, min(100, int(entry.get("demonstrated", 0)))),
+                    "required":     req,
+                    "demonstrated": dem,
                 })
-            print(f"     Bloom's: {[(b['level'], b['demonstrated']) for b in blooms]}")
+            print(f"     Bloom's: {[(b['level'], b['required'], b['demonstrated']) for b in blooms]}")
 
         cluster_feedbacks[cid] = {
             "strengths":    feedback.get("strengths", []),
@@ -668,7 +649,6 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
             "blooms":       blooms,
         }
 
-    # Assign cluster feedback to every student
     for i, student in enumerate(all_students_data):
         student["analysis"]   = cluster_feedbacks.get(int(labels[i]), {
             "strengths": [], "improvements": [], "suggestions": [], "blooms": []
@@ -796,8 +776,6 @@ async def analyse(request: Request):
         print(f"   Key points        : {len(key_points)}")
         print(f"   Score             : {score}/{total}")
 
-        # Wrap into single-student list and run cluster feedback
-        # (with 1 student, clustering trivially assigns to 1 cluster)
         student_data = [{
             "key_points":   key_points,
             "cleaned_text": " ".join(key_points),
