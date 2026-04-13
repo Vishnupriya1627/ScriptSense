@@ -1,46 +1,71 @@
 import React, { useState } from "react";
 import axios from "axios";
 
+// ─────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────
+
 interface Question {
   id: number;
   keyAnswer: string;
   keyDiagram: File | null;
   keyDiagramName: string;
-  studentSheet: File | null;
-  studentSheetName: string;
   marks: number;
   textWeight: number;
   diagramWeight: number;
-  result?: {
-    obtained: number;
-    textSimilarity: number;
-    diagramSimilarity: number;
-    keyPoints?: string[];
-    remarks?: string;
-  } | null;
-  analysis?: {
-    strengths: string[];
-    improvements: string[];
-    suggestions: string[];
-    blooms: { level: string; required: number; demonstrated: number }[];
-  } | null;
-  analysisOpen?: boolean;
 }
 
-interface EvaluationResult {
-  totalObtained: number;
-  totalPossible: number;
-  percentage: number;
-  breakdown: {
-    questionId: number;
-    obtained: number;
-    possible: number;
-    textSimilarity: number;
-    diagramSimilarity: number;
-    textWeight: number;
-    diagramWeight: number;
-  }[];
+interface PerQuestion {
+  score: number;
+  marks: number;
+  remarks: string;
+  emb_score?: number;
+  llm_score?: number;
+  band?: string;
+  band_score?: number;
 }
+
+interface StudentResult {
+  student_name: string;
+  student_index: number;
+  score: number;
+  total: number;
+  key_points: string[];
+  student_answer: string[];
+  per_question: PerQuestion[];
+  analysis?: Analysis | null;
+  analysisOpen?: boolean;
+  cluster_id?: number;
+  band?: string;
+  band_score?: number;
+}
+
+interface Analysis {
+  strengths: string[];
+  improvements: string[];
+  suggestions: string[];
+  blooms: { level: string; required: number; demonstrated: number }[];
+  band?: string;
+  band_score?: number;
+}
+
+interface BatchResult {
+  batch_size: number;
+  average_score: number;
+  highest_score: number;
+  lowest_score: number;
+  total_marks: number;
+  students: StudentResult[];
+  // flat keys for single-student backwards compat
+  score?: number;
+  total?: number;
+  key_points?: string[];
+  per_question?: PerQuestion[];
+}
+
+// ─────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────
 
 const BACKEND_URL = "https://mackenzie-unfilterable-kirby.ngrok-free.dev";
 
@@ -53,302 +78,336 @@ const BLOOM_COLORS: Record<string, { bg: string; border: string }> = {
   Create:     { bg: "#FFEDD5", border: "#F97316" },
 };
 
+const BAND_COLORS: Record<string, { bg: string; text: string }> = {
+  "Excellent":      { bg: "#D1FAE5", text: "#065F46" },
+  "Good":           { bg: "#DBEAFE", text: "#1E40AF" },
+  "Average":        { bg: "#FEF9C3", text: "#92400E" },
+  "Below Average":  { bg: "#FFE4E6", text: "#9F1239" },
+  "Poor":           { bg: "#F3F4F6", text: "#374151" },
+  "N/A":            { bg: "#F3F4F6", text: "#374151" },
+};
+
+// ─────────────────────────────────────────────
+// Sub-components
+// ─────────────────────────────────────────────
+
+const BloomsChart = ({ blooms }: { blooms: { level: string; required: number; demonstrated: number }[] }) => (
+  <div className="mt-2">
+    <p className="text-xs font-semibold uppercase tracking-wider mb-3" style={{ color: "#0F2854" }}>
+      Bloom's Taxonomy Coverage
+    </p>
+    <div className="flex items-center gap-4 mb-2 text-xs text-gray-500">
+      <span className="flex items-center gap-1">
+        <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#0F2854" }} />
+        Required
+      </span>
+      <span className="flex items-center gap-1">
+        <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#BDE8F5" }} />
+        Demonstrated
+      </span>
+    </div>
+    <div className="space-y-2">
+      {blooms.map((b) => {
+        const color = BLOOM_COLORS[b.level] || { bg: "#F3F4F6", border: "#6B7280" };
+        return (
+          <div key={b.level}>
+            <div className="flex justify-between text-xs mb-1">
+              <span className="font-medium" style={{ color: "#0F2854" }}>{b.level}</span>
+              <span className="text-gray-500">{b.demonstrated}% / {b.required}%</span>
+            </div>
+            <div className="w-full bg-gray-100 rounded-full h-2 mb-0.5">
+              <div className="h-2 rounded-full transition-all duration-500"
+                style={{ width: `${b.required}%`, backgroundColor: "#0F2854" }} />
+            </div>
+            <div className="w-full bg-gray-100 rounded-full h-2">
+              <div className="h-2 rounded-full transition-all duration-500"
+                style={{ width: `${b.demonstrated}%`, backgroundColor: color.border }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  </div>
+);
+
+const BandBadge = ({ band }: { band: string }) => {
+  const colors = BAND_COLORS[band] || BAND_COLORS["N/A"];
+  return (
+    <span className="text-xs font-semibold px-2 py-1 rounded-full"
+      style={{ backgroundColor: colors.bg, color: colors.text }}>
+      {band}
+    </span>
+  );
+};
+
+// ─────────────────────────────────────────────
+// Main component
+// ─────────────────────────────────────────────
+
 export default function Home() {
-  const [numQuestions, setNumQuestions] = useState<number>(0);
+  // ── Setup state ──────────────────────────────
+  const [numQuestions, setNumQuestions] = useState(0);
   const [questions, setQuestions] = useState<Question[]>([]);
-  const [currentPage, setCurrentPage] = useState(0);
   const [isSetupComplete, setIsSetupComplete] = useState(false);
-  const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [currentPage, setCurrentPage] = useState(0);
+
+  // ── Student sheets state ──────────────────────
+  const [studentSheets, setStudentSheets] = useState<
+    { file: File | null; name: string }[]
+  >([{ file: null, name: "" }]);
+
+  // ── Results state ─────────────────────────────
+  const [batchResult, setBatchResult] = useState<BatchResult | null>(null);
+  const [selectedStudentIdx, setSelectedStudentIdx] = useState(0);
   const [analysingIndex, setAnalysingIndex] = useState<number | null>(null);
 
-  // ============= SETUP =============
+  // ── Loading ───────────────────────────────────
+  const [loading, setLoading] = useState(false);
+  const [loadingStage, setLoadingStage] = useState("");
+
+  // ═════════════════════════════════════════════
+  // SETUP
+  // ═════════════════════════════════════════════
+
   const handleNumQuestionsSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (numQuestions > 0) {
-      const initialQuestions = Array.from({ length: numQuestions }, (_, i) => ({
+    if (numQuestions < 1) return;
+    setQuestions(
+      Array.from({ length: numQuestions }, (_, i) => ({
         id: i + 1,
         keyAnswer: "",
         keyDiagram: null,
         keyDiagramName: "Add diagram",
-        studentSheet: null,
-        studentSheetName: "Upload answer",
         marks: 0,
         textWeight: 1.0,
         diagramWeight: 0.0,
-        result: null,
-        analysis: null,
-        analysisOpen: false,
-      }));
-      setQuestions(initialQuestions);
-      setIsSetupComplete(true);
-      setCurrentPage(0);
-    }
+      }))
+    );
+    setIsSetupComplete(true);
+    setCurrentPage(0);
   };
 
-  // ============= QUESTION HANDLERS =============
+  // ═════════════════════════════════════════════
+  // QUESTION HANDLERS
+  // ═════════════════════════════════════════════
+
   const handleQuestionChange = (index: number, field: keyof Question, value: any) => {
     setQuestions((prev) => {
       const updated = [...prev];
       updated[index] = { ...updated[index], [field]: value };
-      if (field === "keyDiagram") {
-        updated[index].textWeight = value ? 0.5 : 1.0;
-        updated[index].diagramWeight = value ? 0.5 : 0.0;
-      }
-      if (field === "textWeight" || field === "diagramWeight") {
-        const total = updated[index].textWeight + updated[index].diagramWeight;
-        if (total !== 1.0 && total > 0) {
-          if (field === "textWeight") {
-            updated[index].diagramWeight = Number((1.0 - updated[index].textWeight).toFixed(1));
-          } else {
-            updated[index].textWeight = Number((1.0 - updated[index].diagramWeight).toFixed(1));
-          }
-        }
-      }
-      if (updated[index].result) {
-        updated[index].result = null;
-        updated[index].analysis = null;
-        setEvaluationResult(null);
-      }
       return updated;
     });
   };
 
-  const handleKeyDiagramUpload = (index: number, file: File | null) => {
-    handleQuestionChange(index, "keyDiagram", file);
-    handleQuestionChange(index, "keyDiagramName", file ? file.name : "Add diagram");
-  };
+  // ═════════════════════════════════════════════
+  // STUDENT SHEET HANDLERS
+  // ═════════════════════════════════════════════
 
-  const handleStudentSheetUpload = (index: number, file: File | null) => {
-    setQuestions((prev) => {
+  const addStudentSlot = () =>
+    setStudentSheets((prev) => [...prev, { file: null, name: "" }]);
+
+  const removeStudentSlot = (idx: number) =>
+    setStudentSheets((prev) => prev.filter((_, i) => i !== idx));
+
+  const updateStudentSheet = (idx: number, file: File | null) =>
+    setStudentSheets((prev) => {
       const updated = [...prev];
-      updated[index] = {
-        ...updated[index],
-        studentSheet: file,
-        studentSheetName: file ? file.name : "Upload answer",
-        result: null,
-        analysis: null,
-      };
+      updated[idx] = { ...updated[idx], file };
       return updated;
     });
-    setEvaluationResult(null);
-  };
 
-  // ============= NAVIGATION =============
-  const handleNext = () => { if (currentPage + 1 < questions.length) setCurrentPage(currentPage + 1); };
-  const handlePrev = () => { if (currentPage > 0) setCurrentPage(currentPage - 1); };
-
-  // ============= EVALUATION =============
-  const calculateOverallResults = (updatedQuestions: Question[]) => {
-    let totalObtained = 0;
-    let totalPossible = 0;
-    const breakdown = [];
-    for (const q of updatedQuestions) {
-      if (q.result) {
-        totalObtained += q.result.obtained;
-        totalPossible += q.marks;
-        breakdown.push({
-          questionId: q.id,
-          obtained: q.result.obtained,
-          possible: q.marks,
-          textSimilarity: q.result.textSimilarity,
-          diagramSimilarity: q.result.diagramSimilarity,
-          textWeight: q.textWeight,
-          diagramWeight: q.diagramWeight,
-        });
-      }
-    }
-    setEvaluationResult({
-      totalObtained: Number(totalObtained.toFixed(2)),
-      totalPossible,
-      percentage: totalPossible > 0 ? Number(((totalObtained / totalPossible) * 100).toFixed(1)) : 0,
-      breakdown,
+  const updateStudentName = (idx: number, name: string) =>
+    setStudentSheets((prev) => {
+      const updated = [...prev];
+      updated[idx] = { ...updated[idx], name };
+      return updated;
     });
-  };
 
-  const performEvaluation = async (question: Question, currentIndex: number) => {
+  // ═════════════════════════════════════════════
+  // EVALUATION
+  // ═════════════════════════════════════════════
+
+  const evaluateAll = async () => {
+    // Validate questions
+    for (let i = 0; i < questions.length; i++) {
+      if (!questions[i].keyAnswer.trim()) { alert(`Q${i + 1}: Please enter an answer key`); setCurrentPage(i); return; }
+      if (questions[i].marks <= 0)         { alert(`Q${i + 1}: Please enter valid marks`);  setCurrentPage(i); return; }
+    }
+    // Validate sheets
+    const validSheets = studentSheets.filter((s) => s.file !== null);
+    if (validSheets.length === 0) { alert("Please upload at least one student answer sheet"); return; }
+
     setLoading(true);
-    const formData = new FormData();
-    formData.append("questions", JSON.stringify([{
-      keyAnswer: question.keyAnswer,
-      marks: question.marks,
-      textWeight: question.textWeight,
-      diagramWeight: question.diagramWeight,
-    }]));
-    if (question.keyDiagram) formData.append("diagram_0", question.keyDiagram);
-    if (question.studentSheet) formData.append("answer_sheets", question.studentSheet);
+    setBatchResult(null);
 
     try {
-      console.log("🚀 Sending request to backend...");
+      const formData = new FormData();
+      formData.append(
+        "questions",
+        JSON.stringify(
+          questions.map((q) => ({
+            keyAnswer: q.keyAnswer,
+            marks: q.marks,
+            textWeight: q.textWeight,
+            diagramWeight: q.diagramWeight,
+          }))
+        )
+      );
+
+      const names: string[] = [];
+      validSheets.forEach((s, i) => {
+        formData.append("answer_sheets", s.file as File);
+        names.push(s.name.trim() || `Student_${i + 1}`);
+      });
+      formData.append("student_names", JSON.stringify(names));
+
+      // Stage labels for UX feedback
+      setLoadingStage("📄 Stage 1/3 — Uni-MuMER reading handwriting...");
+      console.log("🚀 Sending batch request...");
+
       const response = await axios.post(`${BACKEND_URL}/similarity`, formData, {
-        headers: { "Content-Type": "multipart/form-data", "ngrok-skip-browser-warning": "true" },
-        timeout: 600000,
+        headers: {
+          "Content-Type": "multipart/form-data",
+          "ngrok-skip-browser-warning": "true",
+        },
+        timeout: 1200000, // 20 min for large batches
         onUploadProgress: (e) => {
-          if (e.total) console.log(`📤 Upload: ${Math.round((e.loaded * 100) / e.total)}%`);
+          if (e.total)
+            setLoadingStage(
+              `📤 Uploading... ${Math.round((e.loaded * 100) / e.total)}%`
+            );
         },
       });
 
-      const result = response.data;
-      console.log("✅ Response:", result);
+      setLoadingStage("✅ Processing complete!");
+      const data: BatchResult = response.data;
+      console.log("✅ Batch response:", data);
 
-      setQuestions((prev) => {
-        const updated = [...prev];
-        updated[currentIndex] = {
-          ...updated[currentIndex],
-          result: {
-            obtained: result.score || 0,
-            textSimilarity: 0,
-            diagramSimilarity: 0,
-            keyPoints: result.key_points || [],
-            remarks: result.per_question?.[0]?.remarks || "",
-          },
+      // Normalise: if backend returned single-student flat shape, wrap it
+      if (!data.students && (data as any).score !== undefined) {
+        const flat = data as any;
+        const wrapped: BatchResult = {
+          batch_size: 1,
+          average_score: flat.score,
+          highest_score: flat.score,
+          lowest_score:  flat.score,
+          total_marks:   flat.total,
+          students: [{
+            student_name:   names[0] || "Student 1",
+            student_index:  0,
+            score:          flat.score,
+            total:          flat.total,
+            key_points:     flat.key_points || [],
+            student_answer: flat.student_answer || [],
+            per_question:   flat.per_question || [],
+            analysis: null,
+            analysisOpen: false,
+          }],
+        };
+        setBatchResult(wrapped);
+      } else {
+        // Ensure analysis/analysisOpen defaults
+        data.students = data.students.map((s) => ({
+          ...s,
           analysis: null,
           analysisOpen: false,
-        };
-        calculateOverallResults(updated);
-        return updated;
-      });
+        }));
+        setBatchResult(data);
+      }
+
+      setSelectedStudentIdx(0);
     } catch (error: any) {
       console.error("❌ Evaluation failed:", error);
       alert(`Evaluation failed: ${error.message}`);
     } finally {
       setLoading(false);
+      setLoadingStage("");
     }
   };
 
-  const evaluateCurrentQuestion = async () => {
-    const question = questions[currentPage];
-    if (!question.keyAnswer.trim()) { alert("Please enter an answer key"); return; }
-    if (!question.studentSheet) { alert("Please upload student's answer sheet"); return; }
-    if (question.marks <= 0) { alert("Please enter marks for this question"); return; }
-    await performEvaluation(question, currentPage);
-  };
+  // ═════════════════════════════════════════════
+  // ANALYSIS (per student)
+  // ═════════════════════════════════════════════
 
-  const evaluateAllQuestions = async () => {
-    const currentQuestions = [...questions];
-    for (let i = 0; i < currentQuestions.length; i++) {
-      const q = currentQuestions[i];
-      if (!q.keyAnswer.trim()) { alert(`Q${i+1} missing answer key`); setCurrentPage(i); return; }
-      if (!q.studentSheet) { alert(`Q${i+1} missing student sheet`); setCurrentPage(i); return; }
-      if (q.marks <= 0) { alert(`Q${i+1} has invalid marks`); setCurrentPage(i); return; }
-    }
-    for (let i = 0; i < currentQuestions.length; i++) {
-      await performEvaluation(currentQuestions[i], i);
-    }
-  };
+  const performAnalysis = async (studentIdx: number) => {
+    if (!batchResult) return;
+    const student = batchResult.students[studentIdx];
+    if (!student) return;
 
-  // ============= ANALYSIS =============
-  const performAnalysis = async (index: number) => {
-    const q = questions[index];
-    if (!q.result) return;
-
-    // toggle close if already open and loaded
-    if (q.analysisOpen && q.analysis) {
-      setQuestions((prev) => {
-        const updated = [...prev];
-        updated[index] = { ...updated[index], analysisOpen: false };
-        return updated;
+    // Toggle close
+    if (student.analysisOpen && student.analysis) {
+      setBatchResult((prev) => {
+        if (!prev) return prev;
+        const updated = [...prev.students];
+        updated[studentIdx] = { ...updated[studentIdx], analysisOpen: false };
+        return { ...prev, students: updated };
       });
       return;
     }
 
-    // open panel
-    setQuestions((prev) => {
-      const updated = [...prev];
-      updated[index] = { ...updated[index], analysisOpen: true };
-      return updated;
+    // Open panel
+    setBatchResult((prev) => {
+      if (!prev) return prev;
+      const updated = [...prev.students];
+      updated[studentIdx] = { ...updated[studentIdx], analysisOpen: true };
+      return { ...prev, students: updated };
     });
 
-    // if already loaded, just show it
-    if (q.analysis) return;
+    if (student.analysis) return; // already loaded
 
-    setAnalysingIndex(index);
+    setAnalysingIndex(studentIdx);
     try {
+      const primaryQ = questions[0];
       const response = await axios.post(
         `${BACKEND_URL}/analyse`,
         {
-          keyAnswer: q.keyAnswer,
-          keyPoints: q.result.keyPoints || [],
-          score: q.result.obtained,
-          total: q.marks,
-          remarks: q.result.remarks || "",
+          keyAnswer:  primaryQ?.keyAnswer || "",
+          keyPoints:  student.key_points || [],
+          score:      student.score,
+          total:      student.total,
+          remarks:    student.per_question?.[0]?.remarks || "",
         },
         {
-          headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
-          timeout: 600000,
+          headers: {
+            "Content-Type": "application/json",
+            "ngrok-skip-browser-warning": "true",
+          },
+          timeout: 300000,
         }
       );
 
-      const data = response.data;
+      const data: Analysis = response.data;
       console.log("✅ Analysis response:", data);
 
-      setQuestions((prev) => {
-        const updated = [...prev];
-        updated[index] = { ...updated[index], analysis: data, analysisOpen: true };
-        return updated;
+      setBatchResult((prev) => {
+        if (!prev) return prev;
+        const updated = [...prev.students];
+        updated[studentIdx] = {
+          ...updated[studentIdx],
+          analysis: data,
+          analysisOpen: true,
+          band: data.band || updated[studentIdx].band,
+        };
+        return { ...prev, students: updated };
       });
     } catch (error: any) {
       console.error("❌ Analysis failed:", error);
       alert(`Analysis failed: ${error.message}`);
-      setQuestions((prev) => {
-        const updated = [...prev];
-        updated[index] = { ...updated[index], analysisOpen: false };
-        return updated;
+      setBatchResult((prev) => {
+        if (!prev) return prev;
+        const updated = [...prev.students];
+        updated[studentIdx] = { ...updated[studentIdx], analysisOpen: false };
+        return { ...prev, students: updated };
       });
     } finally {
       setAnalysingIndex(null);
     }
   };
 
-  // ============= BLOOM'S CHART =============
-  const BloomsChart = ({ blooms }: { blooms: { level: string; required: number; demonstrated: number }[] }) => {
-    return (
-      <div className="mt-4">
-        <p className="text-xs font-semibold uppercase tracking-wider mb-3" style={{ color: "#0F2854" }}>
-          Bloom's Taxonomy Coverage
-        </p>
-        <div className="flex items-center gap-4 mb-2 text-xs text-gray-500">
-          <span className="flex items-center gap-1">
-            <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#0F2854" }}></span>
-            Required by answer key
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: "#BDE8F5" }}></span>
-            Demonstrated by student
-          </span>
-        </div>
-        <div className="space-y-2">
-          {blooms.map((b) => {
-            const color = BLOOM_COLORS[b.level] || { bg: "#F3F4F6", border: "#6B7280" };
-            return (
-              <div key={b.level}>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="font-medium" style={{ color: "#0F2854" }}>{b.level}</span>
-                  <span className="text-gray-500">{b.demonstrated}% / {b.required}%</span>
-                </div>
-                {/* Required bar */}
-                <div className="w-full bg-gray-100 rounded-full h-2 mb-0.5">
-                  <div
-                    className="h-2 rounded-full transition-all duration-500"
-                    style={{ width: `${b.required}%`, backgroundColor: "#0F2854" }}
-                  />
-                </div>
-                {/* Demonstrated bar */}
-                <div className="w-full bg-gray-100 rounded-full h-2">
-                  <div
-                    className="h-2 rounded-full transition-all duration-500"
-                    style={{ width: `${b.demonstrated}%`, backgroundColor: color.border }}
-                  />
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    );
-  };
+  // ═════════════════════════════════════════════
+  // RENDER — SETUP SCREEN
+  // ═════════════════════════════════════════════
 
-  // ============= RENDER =============
   if (!isSetupComplete) {
     return (
       <div className="w-screen h-screen flex items-center justify-center" style={{ backgroundColor: "#BDE8F5" }}>
@@ -363,10 +422,11 @@ export default function Home() {
                 type="number" min="1" value={numQuestions || ""}
                 onChange={(e) => setNumQuestions(parseInt(e.target.value) || 0)}
                 className="w-full p-3 border border-gray-200 rounded-md outline-none focus:border-2 transition-colors"
-                placeholder="e.g., 10" autoFocus
+                placeholder="e.g., 5" autoFocus
               />
             </div>
-            <button type="submit" className="w-full py-3 text-sm uppercase tracking-wider transition-colors rounded-md"
+            <button type="submit"
+              className="w-full py-3 text-sm uppercase tracking-wider transition-colors rounded-md"
               style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}>
               Start
             </button>
@@ -377,267 +437,384 @@ export default function Home() {
   }
 
   const currentQuestion = questions[currentPage];
+  const selectedStudent = batchResult?.students[selectedStudentIdx];
+
+  // ═════════════════════════════════════════════
+  // RENDER — MAIN
+  // ═════════════════════════════════════════════
 
   return (
     <div className="w-screen min-h-screen flex flex-col" style={{ backgroundColor: "#BDE8F5" }}>
+
       {/* HEADER */}
       <div className="h-16 bg-white shadow-sm flex items-center justify-between px-8">
         <h1 className="text-xl font-light" style={{ color: "#0F2854" }}>AutoChecker</h1>
-        <span style={{ color: "#0F2854" }}>Question {currentPage + 1} of {questions.length}</span>
+        <span className="text-sm" style={{ color: "#0F2854" }}>
+          {questions.length} question{questions.length > 1 ? "s" : ""} · {studentSheets.filter(s => s.file).length} sheet{studentSheets.filter(s => s.file).length !== 1 ? "s" : ""} uploaded
+        </span>
       </div>
 
-      {/* MAIN */}
       <div className="flex-1 flex p-6 gap-6 overflow-hidden">
 
-        {/* LEFT PANEL */}
-        <div className="w-1/4 bg-white rounded-2xl shadow-sm p-4 flex flex-col">
-          <h2 className="text-sm uppercase tracking-wider mb-4" style={{ color: "#0F2854" }}>Questions</h2>
-          <div className="flex-1 overflow-y-auto space-y-2">
-            {questions.map((q, idx) => {
-              const isActive = idx === currentPage;
-              const isCompleted = q.result != null;
-              const isIncomplete = !q.keyAnswer.trim() || !q.studentSheet || q.marks <= 0;
-              return (
-                <button key={q.id} onClick={() => setCurrentPage(idx)}
-                  className={`w-full p-3 rounded-lg text-left transition-all flex items-center justify-between ${isActive ? "ring-2" : "hover:bg-gray-50"}`}
-                  style={{ backgroundColor: isActive ? "#BDE8F5" : "white" }}>
-                  <span style={{ color: "#0F2854" }}>Q{q.id}</span>
-                  <div className="flex gap-2">
-                    {isCompleted && <span className="text-xs px-2 py-1 bg-green-100 text-green-700 rounded-full">✓</span>}
-                    {isIncomplete && !isCompleted && <span className="text-xs px-2 py-1 bg-yellow-100 text-yellow-700 rounded-full">!</span>}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-          {evaluationResult && (
-            <div className="mt-4 p-4 rounded-lg" style={{ backgroundColor: "#0F2854" }}>
-              <p className="text-sm text-white/80">Total Score</p>
-              <p className="text-2xl font-light text-white">{evaluationResult.totalObtained}/{evaluationResult.totalPossible}</p>
-              <p className="text-sm text-white/80 mt-1">{evaluationResult.percentage}%</p>
+        {/* ── LEFT SIDEBAR ───────────────────────────────────── */}
+        <div className="w-64 flex flex-col gap-4">
+
+          {/* Question list */}
+          <div className="bg-white rounded-2xl shadow-sm p-4 flex flex-col">
+            <h2 className="text-xs uppercase tracking-wider mb-3" style={{ color: "#0F2854" }}>Questions</h2>
+            <div className="space-y-1">
+              {questions.map((q, idx) => {
+                const isActive     = idx === currentPage;
+                const isIncomplete = !q.keyAnswer.trim() || q.marks <= 0;
+                return (
+                  <button key={q.id} onClick={() => setCurrentPage(idx)}
+                    className={`w-full p-2 rounded-lg text-left text-sm flex items-center justify-between transition-all ${isActive ? "ring-2" : "hover:bg-gray-50"}`}
+                    style={{ backgroundColor: isActive ? "#BDE8F5" : "white" }}>
+                    <span style={{ color: "#0F2854" }}>Q{q.id} — {q.marks || "?"} marks</span>
+                    {isIncomplete && (
+                      <span className="text-xs px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded-full">!</span>
+                    )}
+                  </button>
+                );
+              })}
             </div>
-          )}
+          </div>
+
+          {/* Student sheets */}
+          <div className="bg-white rounded-2xl shadow-sm p-4 flex flex-col flex-1 overflow-hidden">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-xs uppercase tracking-wider" style={{ color: "#0F2854" }}>Student Sheets</h2>
+              <button onClick={addStudentSlot}
+                className="text-xs px-2 py-1 rounded-lg transition-colors"
+                style={{ backgroundColor: "#BDE8F5", color: "#0F2854" }}>
+                + Add
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto space-y-2">
+              {studentSheets.map((s, idx) => (
+                <div key={idx} className="border border-gray-100 rounded-xl p-3 space-y-2">
+
+                  {/* Name input */}
+                  <input
+                    type="text"
+                    value={s.name}
+                    onChange={(e) => updateStudentName(idx, e.target.value)}
+                    placeholder={`Student ${idx + 1} name`}
+                    className="w-full text-xs p-1.5 border border-gray-200 rounded-md outline-none focus:border-blue-300"
+                  />
+
+                  {/* File upload */}
+                  {!s.file ? (
+                    <>
+                      <input type="file" id={`sheet-${idx}`} accept=".pdf,.jpg,.png"
+                        className="hidden"
+                        onChange={(e) => updateStudentSheet(idx, e.target.files?.[0] || null)} />
+                      <label htmlFor={`sheet-${idx}`}
+                        className="flex items-center justify-center gap-1 w-full py-2 border-2 border-dashed border-gray-200 rounded-lg cursor-pointer hover:border-gray-300 transition-colors text-xs text-gray-400">
+                        <span>+</span> Upload sheet
+                      </label>
+                    </>
+                  ) : (
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-green-500 text-sm">✓</span>
+                        <span className="text-xs truncate text-gray-600">{s.file.name}</span>
+                      </div>
+                      <button onClick={() => updateStudentSheet(idx, null)}
+                        className="text-xs text-red-400 hover:text-red-600 ml-1 shrink-0">✕</button>
+                    </div>
+                  )}
+
+                  {/* Remove slot */}
+                  {studentSheets.length > 1 && (
+                    <button onClick={() => removeStudentSlot(idx)}
+                      className="text-xs text-gray-400 hover:text-red-500 w-full text-center">
+                      Remove slot
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Evaluate button */}
+            <button
+              onClick={evaluateAll}
+              disabled={loading}
+              className="mt-3 w-full py-2.5 text-sm font-medium rounded-xl transition-colors disabled:opacity-50"
+              style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}>
+              {loading ? loadingStage || "Processing..." : `Evaluate ${studentSheets.filter(s => s.file).length} Sheet${studentSheets.filter(s => s.file).length !== 1 ? "s" : ""}`}
+            </button>
+          </div>
+
         </div>
 
-        {/* RIGHT PANEL */}
-        <div className="flex-1 bg-white rounded-2xl shadow-sm p-6 flex flex-col overflow-y-auto">
-          {/* Header */}
-          <div className="flex flex-col gap-4 mb-6">
-            <div className="flex justify-between items-center">
-              <h2 className="text-2xl font-light" style={{ color: "#0F2854" }}>Question {currentQuestion.id}</h2>
+        {/* ── RIGHT PANEL ────────────────────────────────────── */}
+        <div className="flex-1 flex flex-col gap-4 overflow-hidden">
+
+          {/* ── Question editor ─────────────────────────────── */}
+          <div className="bg-white rounded-2xl shadow-sm p-6">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-light" style={{ color: "#0F2854" }}>
+                Question {currentQuestion.id}
+              </h2>
               <div className="flex items-center gap-3">
                 <label className="text-sm" style={{ color: "#0F2854" }}>Marks:</label>
                 <input type="number" min="0" value={currentQuestion.marks || ""}
                   onChange={(e) => handleQuestionChange(currentPage, "marks", parseInt(e.target.value) || 0)}
                   className="w-20 p-2 border border-gray-200 rounded-md text-center outline-none focus:border-2" />
+                <div className="flex gap-2">
+                  <button onClick={() => setCurrentPage(p => Math.max(0, p - 1))}
+                    disabled={currentPage === 0}
+                    className="px-3 py-1 text-sm border border-gray-200 rounded-lg disabled:opacity-30 hover:bg-gray-50"
+                    style={{ color: "#0F2854" }}>←</button>
+                  <button onClick={() => setCurrentPage(p => Math.min(questions.length - 1, p + 1))}
+                    disabled={currentPage === questions.length - 1}
+                    className="px-3 py-1 text-sm border border-gray-200 rounded-lg disabled:opacity-30 hover:bg-gray-50"
+                    style={{ color: "#0F2854" }}>→</button>
+                </div>
               </div>
             </div>
-
-            {/* Weight Controls */}
-            <div className="flex items-center gap-6 p-3 bg-gray-50 rounded-lg">
-              <span className="text-sm font-medium" style={{ color: "#0F2854" }}>Weights:</span>
-              <div className="flex items-center gap-2 flex-1">
-                <span className="text-xs text-gray-600 min-w-[60px]">Text:</span>
-                <input type="range" min="0" max="1" step="0.1" value={currentQuestion.textWeight}
-                  onChange={(e) => handleQuestionChange(currentPage, "textWeight", parseFloat(e.target.value))}
-                  disabled={!currentQuestion.keyAnswer.trim()} className="flex-1 h-2 rounded-lg appearance-none cursor-pointer"
-                  style={{ background: `linear-gradient(to right, #0F2854 0%, #0F2854 ${currentQuestion.textWeight * 100}%, #E5E7EB ${currentQuestion.textWeight * 100}%, #E5E7EB 100%)` }} />
-                <span className="text-sm font-medium min-w-[50px]" style={{ color: "#0F2854" }}>
-                  {(currentQuestion.textWeight * 100).toFixed(0)}%
-                </span>
-              </div>
-              <div className="flex items-center gap-2 flex-1">
-                <span className="text-xs text-gray-600 min-w-[60px]">Diagram:</span>
-                <input type="range" min="0" max="1" step="0.1" value={currentQuestion.diagramWeight}
-                  onChange={(e) => handleQuestionChange(currentPage, "diagramWeight", parseFloat(e.target.value))}
-                  disabled={!currentQuestion.keyDiagram} className="flex-1 h-2 rounded-lg appearance-none cursor-pointer"
-                  style={{ background: `linear-gradient(to right, #0F2854 0%, #0F2854 ${currentQuestion.diagramWeight * 100}%, #E5E7EB ${currentQuestion.diagramWeight * 100}%, #E5E7EB 100%)` }} />
-                <span className="text-sm font-medium min-w-[50px]" style={{ color: "#0F2854" }}>
-                  {(currentQuestion.diagramWeight * 100).toFixed(0)}%
-                </span>
-              </div>
-              {!currentQuestion.keyDiagram && <span className="text-xs text-gray-400 italic">Add diagram to enable weight adjustment</span>}
-            </div>
+            <textarea
+              value={currentQuestion.keyAnswer}
+              onChange={(e) => handleQuestionChange(currentPage, "keyAnswer", e.target.value)}
+              className="w-full h-32 p-3 bg-gray-50 border border-gray-200 rounded-lg text-sm outline-none focus:border-2 resize-none"
+              placeholder="Enter model answer for this question..."
+            />
           </div>
 
-          {/* Side-by-side columns */}
-          <div className="flex gap-6 min-h-[320px]">
-            {/* ANSWER KEY */}
-            <div className="flex-1 flex flex-col bg-gray-50 rounded-xl p-4">
-              <h3 className="text-sm font-medium mb-3" style={{ color: "#0F2854" }}>ANSWER KEY</h3>
-              <div className="flex-1 flex flex-col gap-4">
-                <div className="flex-1">
-                  <label className="text-xs text-gray-500">Text Answer</label>
-                  <textarea value={currentQuestion.keyAnswer}
-                    onChange={(e) => handleQuestionChange(currentPage, "keyAnswer", e.target.value)}
-                    className="w-full h-40 p-3 bg-white border border-gray-200 rounded-lg text-sm outline-none focus:border-2 resize-none"
-                    placeholder="Enter model answer..." />
-                </div>
+          {/* ── Results panel ───────────────────────────────── */}
+          {batchResult && (
+            <div className="flex-1 flex flex-col gap-4 overflow-hidden">
+
+              {/* Batch summary bar */}
+              <div className="bg-white rounded-2xl shadow-sm p-4 flex items-center gap-6">
                 <div>
-                  <label className="text-xs text-gray-500">Diagram (Optional)</label>
-                  <div className="mt-1">
-                    <input type="file" id={`key-diagram-${currentQuestion.id}`} accept="image/*" className="hidden"
-                      onChange={(e) => handleKeyDiagramUpload(currentPage, e.target.files?.[0] || null)} />
-                    <label htmlFor={`key-diagram-${currentQuestion.id}`}
-                      className="inline-block px-4 py-2 text-sm bg-white border border-gray-200 rounded-lg cursor-pointer hover:border-gray-300 transition-colors">
-                      {currentQuestion.keyDiagramName}
-                    </label>
-                  </div>
+                  <p className="text-xs text-gray-500">Students</p>
+                  <p className="text-2xl font-light" style={{ color: "#0F2854" }}>{batchResult.batch_size}</p>
+                </div>
+                <div className="h-10 w-px bg-gray-200" />
+                <div>
+                  <p className="text-xs text-gray-500">Average</p>
+                  <p className="text-2xl font-light" style={{ color: "#0F2854" }}>
+                    {batchResult.average_score}/{batchResult.total_marks}
+                  </p>
+                </div>
+                <div className="h-10 w-px bg-gray-200" />
+                <div>
+                  <p className="text-xs text-gray-500">Highest</p>
+                  <p className="text-xl font-light text-green-600">{batchResult.highest_score}</p>
+                </div>
+                <div className="h-10 w-px bg-gray-200" />
+                <div>
+                  <p className="text-xs text-gray-500">Lowest</p>
+                  <p className="text-xl font-light text-red-500">{batchResult.lowest_score}</p>
+                </div>
+                <div className="h-10 w-px bg-gray-200" />
+                {/* Mini score bar chart */}
+                <div className="flex-1 flex items-end gap-1 h-10">
+                  {batchResult.students.map((s, i) => {
+                    const pct = batchResult.total_marks > 0 ? (s.score / batchResult.total_marks) * 100 : 0;
+                    return (
+                      <button key={i} onClick={() => setSelectedStudentIdx(i)}
+                        title={`${s.student_name}: ${s.score}/${s.total}`}
+                        className={`flex-1 rounded-t transition-all ${i === selectedStudentIdx ? "opacity-100" : "opacity-60 hover:opacity-80"}`}
+                        style={{ height: `${Math.max(10, pct)}%`, backgroundColor: "#0F2854" }} />
+                    );
+                  })}
                 </div>
               </div>
-            </div>
 
-            {/* STUDENT ANSWER */}
-            <div className="flex-1 flex flex-col bg-gray-50 rounded-xl p-4">
-              <h3 className="text-sm font-medium mb-3" style={{ color: "#0F2854" }}>STUDENT ANSWER</h3>
-              <div className="flex-1 flex flex-col gap-4">
-                <div className="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-gray-300 rounded-lg p-6">
-                  {!currentQuestion.studentSheet ? (
-                    <>
-                      <input type="file" id={`student-sheet-${currentQuestion.id}`} accept=".pdf,.txt,.jpg,.png"
-                        className="hidden" onChange={(e) => handleStudentSheetUpload(currentPage, e.target.files?.[0] || null)} />
-                      <label htmlFor={`student-sheet-${currentQuestion.id}`} className="cursor-pointer text-center">
-                        <div className="w-16 h-16 mx-auto mb-3 rounded-full flex items-center justify-center" style={{ backgroundColor: "#BDE8F5" }}>
-                          <span className="text-2xl" style={{ color: "#0F2854" }}>+</span>
+              {/* Student tabs + detail */}
+              <div className="flex-1 flex gap-4 overflow-hidden">
+
+                {/* Student list */}
+                <div className="w-52 bg-white rounded-2xl shadow-sm p-3 overflow-y-auto">
+                  <p className="text-xs uppercase tracking-wider mb-2 px-1" style={{ color: "#0F2854" }}>Results</p>
+                  {batchResult.students.map((s, i) => {
+                    const isActive = i === selectedStudentIdx;
+                    const pct      = batchResult.total_marks > 0
+                      ? Math.round((s.score / batchResult.total_marks) * 100)
+                      : 0;
+                    return (
+                      <button key={i} onClick={() => setSelectedStudentIdx(i)}
+                        className={`w-full p-2.5 rounded-xl text-left mb-1 transition-all ${isActive ? "ring-2" : "hover:bg-gray-50"}`}
+                        style={{ backgroundColor: isActive ? "#BDE8F5" : "white" }}>
+                        <p className="text-sm font-medium truncate" style={{ color: "#0F2854" }}>{s.student_name}</p>
+                        <div className="flex items-center justify-between mt-1">
+                          <p className="text-xs text-gray-500">{s.score}/{s.total}</p>
+                          {s.band && <BandBadge band={s.band} />}
                         </div>
-                        <p className="text-sm font-medium" style={{ color: "#0F2854" }}>Upload Answer Sheet</p>
-                        <p className="text-xs text-gray-400 mt-1">PDF, Image, or TXT</p>
-                      </label>
-                    </>
-                  ) : (
-                    <div className="w-full text-center">
-                      <div className="w-16 h-16 mx-auto mb-3 rounded-full flex items-center justify-center bg-green-100">
-                        <span className="text-2xl text-green-600">✓</span>
-                      </div>
-                      <p className="text-sm font-medium truncate max-w-full" style={{ color: "#0F2854" }}>
-                        {currentQuestion.studentSheetName}
-                      </p>
-                      <p className="text-xs text-gray-500 mt-1">
-                        {(currentQuestion.studentSheet.size / 1024).toFixed(1)} KB
-                      </p>
-                      <button onClick={() => handleStudentSheetUpload(currentPage, null)}
-                        className="text-xs text-red-500 mt-2 hover:underline">Remove</button>
-                    </div>
-                  )}
+                        {/* Mini progress bar */}
+                        <div className="w-full bg-gray-100 rounded-full h-1 mt-1.5">
+                          <div className="h-1 rounded-full" style={{ width: `${pct}%`, backgroundColor: "#0F2854" }} />
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
 
-                {/* Score card */}
-                {currentQuestion.result && (
-                  <div className="p-4 rounded-lg" style={{ backgroundColor: "#BDE8F5" }}>
-                    <div className="flex justify-between items-center">
-                      <span className="text-sm" style={{ color: "#0F2854" }}>Score:</span>
-                      <span className="text-xl font-light" style={{ color: "#0F2854" }}>
-                        {currentQuestion.result.obtained.toFixed(1)}/{currentQuestion.marks}
-                      </span>
+                {/* Student detail */}
+                {selectedStudent && (
+                  <div className="flex-1 bg-white rounded-2xl shadow-sm p-5 overflow-y-auto">
+
+                    {/* Student header */}
+                    <div className="flex items-start justify-between mb-4">
+                      <div>
+                        <h3 className="text-xl font-light" style={{ color: "#0F2854" }}>
+                          {selectedStudent.student_name}
+                        </h3>
+                        <div className="flex items-center gap-2 mt-1">
+                          <span className="text-2xl font-light" style={{ color: "#0F2854" }}>
+                            {selectedStudent.score}/{selectedStudent.total}
+                          </span>
+                          {selectedStudent.band && <BandBadge band={selectedStudent.band} />}
+                          {selectedStudent.cluster_id !== undefined && (
+                            <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-500 rounded-full">
+                              Cluster {selectedStudent.cluster_id}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => performAnalysis(selectedStudentIdx)}
+                        disabled={analysingIndex === selectedStudentIdx}
+                        className="px-4 py-2 text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
+                        style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}>
+                        {analysingIndex === selectedStudentIdx
+                          ? "⏳ Analysing..."
+                          : selectedStudent.analysisOpen && selectedStudent.analysis
+                          ? "▲ Hide Analysis"
+                          : "🔍 Analyse Answer"}
+                      </button>
                     </div>
-                    {currentQuestion.result.remarks && (
-                      <p className="text-xs text-gray-600 mt-2 italic">{currentQuestion.result.remarks}</p>
+
+                    {/* Per-question breakdown */}
+                    {selectedStudent.per_question?.length > 0 && (
+                      <div className="mb-4">
+                        <p className="text-xs uppercase tracking-wider text-gray-500 mb-2">Score Breakdown</p>
+                        <div className="space-y-2">
+                          {selectedStudent.per_question.map((pq, qi) => (
+                            <div key={qi} className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
+                              <span className="text-sm font-medium w-8" style={{ color: "#0F2854" }}>Q{qi + 1}</span>
+                              <div className="flex-1">
+                                <div className="flex justify-between text-xs mb-1">
+                                  <span className="text-gray-600">{pq.remarks || "—"}</span>
+                                  <span className="font-medium" style={{ color: "#0F2854" }}>{pq.score}/{pq.marks}</span>
+                                </div>
+                                <div className="w-full bg-gray-200 rounded-full h-1.5">
+                                  <div className="h-1.5 rounded-full" style={{
+                                    width: `${pq.marks > 0 ? (pq.score / pq.marks) * 100 : 0}%`,
+                                    backgroundColor: "#0F2854",
+                                  }} />
+                                </div>
+                                {(pq.emb_score !== undefined || pq.llm_score !== undefined) && (
+                                  <div className="flex gap-3 mt-1 text-xs text-gray-400">
+                                    {pq.emb_score !== undefined && <span>Emb: {pq.emb_score}</span>}
+                                    {pq.llm_score !== undefined && <span>LLM: {pq.llm_score}</span>}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     )}
-                    {/* Analyse button */}
-                    <button
-                      onClick={() => performAnalysis(currentPage)}
-                      disabled={analysingIndex === currentPage}
-                      className="mt-3 w-full py-2 text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
-                      style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}
-                    >
-                      {analysingIndex === currentPage
-                        ? "⏳ Analysing..."
-                        : currentQuestion.analysisOpen && currentQuestion.analysis
-                        ? "▲ Hide Analysis"
-                        : "🔍 Analyse Answer"}
-                    </button>
+
+                    {/* Key points */}
+                    {selectedStudent.key_points?.length > 0 && (
+                      <div className="mb-4">
+                        <p className="text-xs uppercase tracking-wider text-gray-500 mb-2">Extracted Key Points</p>
+                        <div className="flex flex-wrap gap-2">
+                          {selectedStudent.key_points.map((kp, i) => (
+                            <span key={i} className="text-xs px-2 py-1 bg-blue-50 text-blue-700 rounded-full">{kp}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Analysis panel */}
+                    {selectedStudent.analysisOpen && (
+                      <div className="border border-gray-200 rounded-2xl overflow-hidden mt-2">
+                        <div className="p-3" style={{ backgroundColor: "#0F2854" }}>
+                          <h4 className="text-sm font-semibold text-white uppercase tracking-wider">
+                            📊 Answer Analysis
+                          </h4>
+                        </div>
+
+                        {!selectedStudent.analysis ? (
+                          <div className="p-8 text-center text-gray-400 text-sm">
+                            ⏳ Generating analysis... this may take 1–2 minutes
+                          </div>
+                        ) : (
+                          <div className="p-5 grid grid-cols-2 gap-6">
+                            {/* Feedback cards */}
+                            <div className="space-y-3">
+                              <div className="bg-green-50 border border-green-200 rounded-xl p-3">
+                                <p className="text-xs font-semibold text-green-700 uppercase tracking-wider mb-2">✅ Strengths</p>
+                                <ul className="space-y-1">
+                                  {selectedStudent.analysis.strengths.map((s, i) => (
+                                    <li key={i} className="text-sm text-green-800 flex gap-2"><span>•</span><span>{s}</span></li>
+                                  ))}
+                                </ul>
+                              </div>
+                              <div className="bg-red-50 border border-red-200 rounded-xl p-3">
+                                <p className="text-xs font-semibold text-red-700 uppercase tracking-wider mb-2">⚠️ Improvements</p>
+                                <ul className="space-y-1">
+                                  {selectedStudent.analysis.improvements.map((s, i) => (
+                                    <li key={i} className="text-sm text-red-800 flex gap-2"><span>•</span><span>{s}</span></li>
+                                  ))}
+                                </ul>
+                              </div>
+                              <div className="bg-blue-50 border border-blue-200 rounded-xl p-3">
+                                <p className="text-xs font-semibold text-blue-700 uppercase tracking-wider mb-2">💡 Suggestions</p>
+                                <ul className="space-y-1">
+                                  {selectedStudent.analysis.suggestions.map((s, i) => (
+                                    <li key={i} className="text-sm text-blue-800 flex gap-2"><span>•</span><span>{s}</span></li>
+                                  ))}
+                                </ul>
+                              </div>
+                            </div>
+
+                            {/* Bloom's chart */}
+                            <div className="bg-gray-50 rounded-xl p-4">
+                              <BloomsChart blooms={selectedStudent.analysis.blooms} />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
             </div>
-          </div>
+          )}
 
-          {/* ===== ANALYSIS PANEL ===== */}
-          {currentQuestion.analysisOpen && (
-            <div className="mt-6 border border-gray-200 rounded-2xl overflow-hidden">
-              <div className="p-4" style={{ backgroundColor: "#0F2854" }}>
-                <h3 className="text-sm font-semibold text-white uppercase tracking-wider">
-                  📊 Answer Analysis — Question {currentQuestion.id}
-                </h3>
+          {/* Empty state */}
+          {!batchResult && !loading && (
+            <div className="flex-1 bg-white rounded-2xl shadow-sm flex items-center justify-center">
+              <div className="text-center text-gray-400">
+                <p className="text-4xl mb-3">📝</p>
+                <p className="text-sm">Fill in the answer keys, upload student sheets,</p>
+                <p className="text-sm">then click <strong>Evaluate</strong> to begin.</p>
               </div>
-
-              {!currentQuestion.analysis ? (
-                <div className="p-8 text-center text-gray-400 text-sm">
-                  ⏳ Generating analysis... this may take 1-2 minutes
-                </div>
-              ) : (
-                <div className="p-5 grid grid-cols-2 gap-6">
-                  {/* LEFT: Feedback cards */}
-                  <div className="space-y-4">
-                    {/* Strengths */}
-                    <div className="bg-green-50 border border-green-200 rounded-xl p-4">
-                      <p className="text-xs font-semibold text-green-700 uppercase tracking-wider mb-2">✅ Strengths</p>
-                      <ul className="space-y-1">
-                        {currentQuestion.analysis.strengths.map((s, i) => (
-                          <li key={i} className="text-sm text-green-800 flex gap-2">
-                            <span>•</span><span>{s}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-
-                    {/* Areas to improve */}
-                    <div className="bg-red-50 border border-red-200 rounded-xl p-4">
-                      <p className="text-xs font-semibold text-red-700 uppercase tracking-wider mb-2">⚠️ Areas to Improve</p>
-                      <ul className="space-y-1">
-                        {currentQuestion.analysis.improvements.map((s, i) => (
-                          <li key={i} className="text-sm text-red-800 flex gap-2">
-                            <span>•</span><span>{s}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-
-                    {/* Suggestions */}
-                    <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
-                      <p className="text-xs font-semibold text-blue-700 uppercase tracking-wider mb-2">💡 Suggestions</p>
-                      <ul className="space-y-1">
-                        {currentQuestion.analysis.suggestions.map((s, i) => (
-                          <li key={i} className="text-sm text-blue-800 flex gap-2">
-                            <span>•</span><span>{s}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
-
-                  {/* RIGHT: Bloom's chart */}
-                  <div className="bg-gray-50 rounded-xl p-4">
-                    <BloomsChart blooms={currentQuestion.analysis.blooms} />
-                  </div>
-                </div>
-              )}
             </div>
           )}
 
-          {/* ACTION BUTTONS */}
-          <div className="mt-6 flex items-center justify-between">
-            <div className="flex gap-3">
-              <button onClick={handlePrev} disabled={currentPage === 0}
-                className="px-4 py-2 text-sm border border-gray-200 rounded-lg disabled:opacity-30 disabled:cursor-not-allowed hover:bg-gray-50 transition-colors"
-                style={{ color: "#0F2854" }}>← Previous</button>
-              <button onClick={handleNext} disabled={currentPage === questions.length - 1}
-                className="px-4 py-2 text-sm border border-gray-200 rounded-lg disabled:opacity-30 disabled:cursor-not-allowed hover:bg-gray-50 transition-colors"
-                style={{ color: "#0F2854" }}>Next →</button>
+          {/* Loading state */}
+          {loading && (
+            <div className="flex-1 bg-white rounded-2xl shadow-sm flex items-center justify-center">
+              <div className="text-center">
+                <div className="w-12 h-12 border-4 border-gray-200 border-t-blue-600 rounded-full animate-spin mx-auto mb-4"
+                  style={{ borderTopColor: "#0F2854" }} />
+                <p className="text-sm font-medium" style={{ color: "#0F2854" }}>{loadingStage || "Processing..."}</p>
+                <p className="text-xs text-gray-400 mt-2">
+                  Uni-MuMER → Qwen → Clustering. This takes a few minutes.
+                </p>
+              </div>
             </div>
-            <div className="flex gap-3">
-              <button onClick={evaluateCurrentQuestion} disabled={loading}
-                className="px-6 py-2 text-sm rounded-lg transition-colors disabled:opacity-50"
-                style={{ backgroundColor: "#BDE8F5", color: "#0F2854" }}>
-                {loading ? "Evaluating..." : "Evaluate Current"}
-              </button>
-              <button onClick={evaluateAllQuestions} disabled={loading}
-                className="px-6 py-2 text-sm rounded-lg transition-colors disabled:opacity-50"
-                style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}>
-                Evaluate All
-              </button>
-            </div>
-          </div>
+          )}
+
         </div>
       </div>
     </div>

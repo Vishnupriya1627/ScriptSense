@@ -37,17 +37,17 @@ sys.path.insert(0, '/content/Uni-MuMER')
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
 QWEN_MODEL_PATH   = "/content/models/Qwen2.5-3B-Instruct"
 
-# Cosine similarity threshold for embedding coverage scoring
+# Directory to persist Uni-MuMER OCR outputs between model loads
+OCR_CACHE_DIR = "/content/ocr_cache"
+os.makedirs(OCR_CACHE_DIR, exist_ok=True)
+
+# =========================
+# 🔹 HYPERPARAMETERS
+# =========================
 EMBEDDING_THRESHOLD = 0.60
-
-# Hybrid scoring weight: final = ALPHA * embedding_score + (1-ALPHA) * llm_score
-ALPHA = 0.6
-
-# Number of clusters for batch feedback generation
-N_CLUSTERS = 4
-
-# Number of LLM passes for self-consistency ensemble scoring
-ENSEMBLE_PASSES = 3
+ALPHA               = 0.6
+N_CLUSTERS          = 4
+ENSEMBLE_PASSES     = 3
 
 # =========================
 # 🔹 GLOBAL MODEL STATE
@@ -57,6 +57,7 @@ _qwen_sampling   = None
 _unimer_llm      = None
 _unimer_sampling = None
 _embedder        = None
+
 
 # ─────────────────────────────────────────────
 # Model loading / unloading
@@ -150,21 +151,14 @@ def get_qwen():
 # =========================
 
 def extract_json(text: str, expected_type: type):
-    """
-    Robustly extract a JSON object ({}) or array ([]) from messy LLM output.
-    Strips markdown fences, leading prose, and trailing text.
-    """
+    """Robustly extract JSON object or array from messy LLM output."""
     text = re.sub(r"```[a-z]*|```", "", text).strip()
-
-    # Direct parse first
     try:
         parsed = json.loads(text)
         if isinstance(parsed, expected_type):
             return parsed
     except Exception:
         pass
-
-    # Scan for outermost matching bracket pair
     start_char = '{' if expected_type == dict else '['
     end_char   = '}' if expected_type == dict else ']'
     start = text.find(start_char)
@@ -176,7 +170,6 @@ def extract_json(text: str, expected_type: type):
                 return parsed
         except Exception:
             pass
-
     return None
 
 
@@ -185,14 +178,11 @@ def extract_json(text: str, expected_type: type):
 # =========================
 
 def clean_unimer_output(text: str) -> str:
-    """Protect LaTeX blocks from the letter-merging regex."""
     latex_blocks = {}
-
     def protect(m):
         key = f"__LATEX{len(latex_blocks)}__"
         latex_blocks[key] = m.group(0)
         return key
-
     text = re.sub(r'\$[^$]+\$', protect, text)
     text = re.sub(r'\\[a-zA-Z]+\{[^}]*\}', protect, text)
     text = re.sub(
@@ -205,13 +195,17 @@ def clean_unimer_output(text: str) -> str:
     return text
 
 
-def run_unimer_on_images(images: list) -> dict:
+def run_unimer_on_images(images: list, student_label: str) -> str:
+    """
+    Run Uni-MuMER on a list of PIL images.
+    Returns raw_text string.
+    student_label used only for logging.
+    """
     from qwen_vl_utils import process_vision_info
     from transformers import AutoProcessor
     import tempfile
 
-    print("━" * 50)
-    print(f"🔍 [OCR] Starting Uni-MuMER inference on {len(images)} page(s)...")
+    print(f"  🔍 [OCR] Running Uni-MuMER on '{student_label}' ({len(images)} page(s))...")
     t0 = time.time()
 
     llm, sampling = get_unimer()
@@ -219,12 +213,10 @@ def run_unimer_on_images(images: list) -> dict:
 
     all_lines = []
     for page_idx, img in enumerate(images):
-        print(f"  📄 [OCR] Processing page {page_idx + 1}/{len(images)}...")
         w, h = img.size
         if max(w, h) > 800:
             scale = 800 / max(w, h)
             img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            print(f"       Resized to {img.size[0]}x{img.size[1]}")
 
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             img.save(tmp.name)
@@ -238,29 +230,65 @@ def run_unimer_on_images(images: list) -> dict:
             ]
         }]
 
-        prompt_text         = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, _     = process_vision_info(messages)
-        inputs              = {"prompt": prompt_text, "multi_modal_data": {"image": image_inputs}}
-        output              = llm.generate([inputs], sampling)[0].outputs[0].text
-        output              = clean_unimer_output(output.strip())
+        prompt_text     = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, _ = process_vision_info(messages)
+        inputs          = {"prompt": prompt_text, "multi_modal_data": {"image": image_inputs}}
+        output          = llm.generate([inputs], sampling)[0].outputs[0].text
+        output          = clean_unimer_output(output.strip())
         os.unlink(tmp_path)
 
         lines = [l.strip() for l in output.split('\n') if l.strip()]
         for line in lines:
-            all_lines.append(f"Line {len(all_lines) + 1}: {line}")
+            all_lines.append(f"Line {len(all_lines)+1}: {line}")
 
     raw_text = "\n".join(all_lines)
-    elapsed  = time.time() - t0
+    print(f"  ✅ [OCR] '{student_label}' — {len(all_lines)} lines in {time.time()-t0:.1f}s.")
+    print(f"     Preview: {raw_text[:120].replace(chr(10),' ')}{'...' if len(raw_text)>120 else ''}")
+    return raw_text
 
-    print(f"✅ [OCR] Done. {len(all_lines)} lines extracted in {elapsed:.1f}s.")
-    print(f"   Raw preview: {raw_text[:200].replace(chr(10), ' ')}{'...' if len(raw_text) > 200 else ''}")
-    print("━" * 50)
 
-    return {"raw_text": raw_text, "lines": all_lines}
+# ── BATCH OCR: all sheets through Uni-MuMER, save to OCR_CACHE_DIR ──────────
+
+def batch_ocr(sheets_bytes: list, student_names: list) -> list:
+    """
+    Runs Uni-MuMER on every sheet in one model load.
+    Saves each result as a .json file in OCR_CACHE_DIR.
+
+    Returns list of cache file paths in same order as input.
+    """
+    print("\n" + "═" * 60)
+    print(f"🔍 [BATCH OCR] Starting — {len(sheets_bytes)} sheet(s)")
+    print("═" * 60)
+
+    # Clear old cache
+    shutil.rmtree(OCR_CACHE_DIR, ignore_errors=True)
+    os.makedirs(OCR_CACHE_DIR, exist_ok=True)
+
+    cache_paths = []
+
+    for idx, (content, name) in enumerate(zip(sheets_bytes, student_names)):
+        print(f"\n  📄 Sheet {idx+1}/{len(sheets_bytes)}: {name}")
+        images    = convert_from_bytes(content)
+        raw_text  = run_unimer_on_images(images, name)
+
+        cache_path = os.path.join(OCR_CACHE_DIR, f"sheet_{idx:04d}.json")
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "student_name": name,
+                "raw_text":     raw_text,
+                "sheet_index":  idx,
+            }, f, ensure_ascii=False, indent=2)
+
+        cache_paths.append(cache_path)
+        print(f"  💾 [OCR] Saved to {cache_path}")
+
+    print(f"\n✅ [BATCH OCR] All {len(sheets_bytes)} sheets processed and cached.")
+    print("═" * 60)
+    return cache_paths
 
 
 # =========================
-# 🔹 HELPER
+# 🔹 HELPERS
 # =========================
 
 def wrap_into_lines(text: str, words_per_line: int = 8) -> list:
@@ -272,14 +300,13 @@ def wrap_into_lines(text: str, words_per_line: int = 8) -> list:
 # 🔹 QWEN PASS 1 — CLEAN TEXT
 # =========================
 
-def qwen_clean_text(raw_text: str) -> str:
+def qwen_clean_text(raw_text: str, label: str = "") -> str:
     if not raw_text.strip():
-        print("⚠️  [CLEAN] Empty raw text — skipping.")
+        print(f"  ⚠️  [CLEAN] '{label}' — empty raw text, skipping.")
         return ""
 
-    print("🧹 [CLEAN] Qwen Pass 1: Fixing OCR noise and spacing...")
+    print(f"  🧹 [CLEAN] Cleaning OCR output for '{label}'...")
     t0 = time.time()
-
     qwen, sampling = get_qwen()
 
     prompt = (
@@ -295,9 +322,7 @@ def qwen_clean_text(raw_text: str) -> str:
 
     result = qwen.generate([prompt], sampling)[0].outputs[0].text
     result = result.replace("<|im_end|>", "").strip()
-
-    print(f"✅ [CLEAN] Done in {time.time()-t0:.1f}s. Output length: {len(result)} chars.")
-    print(f"   Preview: {result[:150].replace(chr(10), ' ')}{'...' if len(result) > 150 else ''}")
+    print(f"  ✅ [CLEAN] '{label}' done in {time.time()-t0:.1f}s — {len(result)} chars.")
     return result
 
 
@@ -305,14 +330,13 @@ def qwen_clean_text(raw_text: str) -> str:
 # 🔹 QWEN PASS 2 — EXTRACT KEY POINTS
 # =========================
 
-def qwen_extract_key_points(cleaned_text: str) -> list:
+def qwen_extract_key_points(cleaned_text: str, label: str = "") -> list:
     if not cleaned_text.strip():
-        print("⚠️  [KP] Empty cleaned text — returning empty key points.")
+        print(f"  ⚠️  [KP] '{label}' — empty text, returning [].")
         return []
 
-    print("🔑 [KP] Qwen Pass 2: Extracting key points...")
+    print(f"  🔑 [KP] Extracting key points for '{label}'...")
     t0 = time.time()
-
     qwen, sampling = get_qwen()
 
     prompt = (
@@ -332,15 +356,15 @@ def qwen_extract_key_points(cleaned_text: str) -> list:
     points = extract_json(raw, list)
 
     if not isinstance(points, list):
-        print("⚠️  [KP] JSON parse failed — falling back to sentence split.")
+        print(f"  ⚠️  [KP] JSON parse failed for '{label}' — sentence split fallback.")
         sentences = re.split(r'[.;]\s*', cleaned_text)
         points    = [s.strip() for s in sentences if len(s.strip()) > 4]
     else:
         points = [str(p).strip() for p in points if str(p).strip()]
 
-    print(f"✅ [KP] Done in {time.time()-t0:.1f}s. Extracted {len(points)} key points:")
+    print(f"  ✅ [KP] '{label}' — {len(points)} key points in {time.time()-t0:.1f}s.")
     for i, p in enumerate(points):
-        print(f"     {i+1}. {p}")
+        print(f"       {i+1}. {p}")
     return points
 
 
@@ -351,54 +375,44 @@ def qwen_extract_key_points(cleaned_text: str) -> list:
 def score_embedding(student_points: list, teacher_points: list,
                     marks: int, threshold: float = EMBEDDING_THRESHOLD) -> float:
     if not student_points or not teacher_points:
-        print("⚠️  [EMB] Missing student or teacher points — returning 0.")
+        print("  ⚠️  [EMB] Missing points — returning 0.")
         return 0.0
 
-    print(f"📐 [EMB] Computing embedding coverage score...")
-    print(f"   Teacher points : {len(teacher_points)}")
-    print(f"   Student points : {len(student_points)}")
-    print(f"   Threshold      : {threshold}")
-
-    embedder  = get_embedder()
-    t_embs    = embedder.encode(teacher_points)
-    s_embs    = embedder.encode(student_points)
-    sim_mat   = cosine_similarity(s_embs, t_embs)
-    best      = sim_mat.max(axis=0)
+    embedder = get_embedder()
+    t_embs   = embedder.encode(teacher_points)
+    s_embs   = embedder.encode(student_points)
+    sim_mat  = cosine_similarity(s_embs, t_embs)
+    best     = sim_mat.max(axis=0)
 
     covered_count = int((best >= threshold).sum())
     coverage      = covered_count / len(teacher_points)
     emb_score     = round(coverage * marks, 2)
 
-    print(f"   Covered        : {covered_count}/{len(teacher_points)} teacher points (≥{threshold})")
-    print(f"   Coverage       : {coverage:.2%}")
-    print(f"   Embedding score: {emb_score}/{marks}")
-
+    print(f"  📐 [EMB] Coverage: {covered_count}/{len(teacher_points)} points ≥{threshold} → {emb_score}/{marks}")
     for ti, tp in enumerate(teacher_points):
-        best_student = student_points[int(sim_mat[:, ti].argmax())]
-        print(f"     TP{ti+1} [{best[ti]:.2f}] '{tp[:60]}' ← '{best_student[:60]}'")
+        best_s = student_points[int(sim_mat[:, ti].argmax())]
+        print(f"       TP{ti+1} [{best[ti]:.2f}] '{tp[:55]}' ← '{best_s[:55]}'")
 
     return emb_score
 
 
 # =========================
-# 🔹 LLM ENSEMBLE SCORE (self-consistency)
+# 🔹 LLM ENSEMBLE SCORE
 # =========================
 
 def score_llm_ensemble(student_points: list, key_answer: str,
-                        marks: int, n_passes: int = ENSEMBLE_PASSES) -> float:
-    print(f"🤖 [LLM] Self-consistency scoring: {n_passes} passes at temperature=0.3...")
+                        marks: int, n_passes: int = ENSEMBLE_PASSES) -> tuple:
+    print(f"  🤖 [LLM] Self-consistency: {n_passes} passes at temp=0.3...")
     t0 = time.time()
 
-    qwen, _ = get_qwen()
+    qwen, _  = get_qwen()
     sampling = SamplingParams(temperature=0.3, max_tokens=256)
-
     student_str = "\n".join(f"- {p}" for p in student_points) if student_points else "(no answer detected)"
 
     prompt = (
         "<|im_start|>system\n"
         "You are a strict but fair exam evaluator. "
-        "Given a key answer and student key points, award a score. "
-        "Respond ONLY with valid raw JSON — no markdown, no prose: "
+        "Respond ONLY with raw JSON — no markdown, no prose: "
         "{\"score\": <number>, \"remarks\": \"<one sentence>\"}"
         "<|im_end|>\n"
         f"<|im_start|>user\n"
@@ -412,28 +426,25 @@ def score_llm_ensemble(student_points: list, key_answer: str,
     scores  = []
     remarks = ""
     for i in range(n_passes):
-        raw = "{" + qwen.generate([prompt], sampling)[0].outputs[0].text
-        raw = raw.replace("<|im_end|>", "").strip()
+        raw    = "{" + qwen.generate([prompt], sampling)[0].outputs[0].text
+        raw    = raw.replace("<|im_end|>", "").strip()
         parsed = extract_json(raw, dict)
         if parsed:
             s = max(0.0, min(float(marks), float(parsed.get("score", 0))))
             scores.append(s)
             if not remarks:
                 remarks = parsed.get("remarks", "")
-            print(f"     Pass {i+1}: score={s}/{marks}")
+            print(f"       Pass {i+1}: {s}/{marks}")
         else:
-            print(f"     Pass {i+1}: ⚠️  parse failed — raw: {raw[:80]}")
+            print(f"       Pass {i+1}: ⚠️  parse failed — {raw[:60]}")
 
     if not scores:
-        print("⚠️  [LLM] All passes failed — returning 0.")
+        print("  ⚠️  [LLM] All passes failed — returning 0.")
         return 0.0, ""
 
-    final = float(median(scores))
+    final  = float(median(scores))
     spread = max(scores) - min(scores)
-    print(f"   Scores across passes : {scores}")
-    print(f"   Spread (max-min)     : {spread:.2f}  {'⚠️ high variance' if spread > marks * 0.3 else '✅ stable'}")
-    print(f"   Median score         : {final}/{marks}")
-    print(f"   Done in {time.time()-t0:.1f}s.")
+    print(f"  ✅ [LLM] Passes={scores}  spread={spread:.2f}  median={final}/{marks}  ({time.time()-t0:.1f}s)")
     return final, remarks
 
 
@@ -442,62 +453,98 @@ def score_llm_ensemble(student_points: list, key_answer: str,
 # =========================
 
 def hybrid_score(student_points: list, teacher_points: list,
-                 key_answer: str, marks: int,
-                 alpha: float = ALPHA) -> dict:
-    print("━" * 50)
-    print(f"⚖️  [HYBRID] Computing hybrid score (α={alpha})...")
-
-    emb_score            = score_embedding(student_points, teacher_points, marks)
-    llm_score, remarks   = score_llm_ensemble(student_points, key_answer, marks)
-    final                = round(alpha * emb_score + (1 - alpha) * llm_score, 2)
-
-    print(f"   📐 Embedding score : {emb_score}/{marks}")
-    print(f"   🤖 LLM ensemble    : {llm_score}/{marks}")
-    print(f"   ✅ Hybrid final    : {final}/{marks}  (α={alpha}×emb + {1-alpha}×llm)")
-    print("━" * 50)
-
-    return {
-        "score":     final,
-        "emb_score": emb_score,
-        "llm_score": llm_score,
-        "remarks":   remarks,
-    }
+                 key_answer: str, marks: int, alpha: float = ALPHA) -> dict:
+    print(f"  ⚖️  [HYBRID] α={alpha}  marks={marks}")
+    emb_score          = score_embedding(student_points, teacher_points, marks)
+    llm_score, remarks = score_llm_ensemble(student_points, key_answer, marks)
+    final              = round(alpha * emb_score + (1 - alpha) * llm_score, 2)
+    print(f"  ✅ [HYBRID] emb={emb_score}  llm={llm_score}  final={final}/{marks}")
+    return {"score": final, "emb_score": emb_score, "llm_score": llm_score, "remarks": remarks}
 
 
 # =========================
-# 🔹 EVALUATE
+# 🔹 CLUSTER SCORE BANDS
+# (compare cluster centroids to teacher answer embedding)
 # =========================
 
-def evaluate_with_hybrid(key_points: list, questions_data: list) -> dict:
+def assign_cluster_score_bands(
+    all_embs: np.ndarray,
+    labels: np.ndarray,
+    centroids: np.ndarray,
+    teacher_emb: np.ndarray,
+    marks: int,
+    k: int,
+) -> dict:
+    """
+    For each cluster, compute cosine similarity between its centroid
+    and the teacher answer embedding.  Map similarity → score band.
+
+    Returns {cluster_id: {"band": str, "band_score": float}}
+    """
+    # teacher_emb shape: (1, D) or (D,)
+    if teacher_emb.ndim == 1:
+        teacher_emb = teacher_emb.reshape(1, -1)
+
+    bands = {}
+    print("  🎯 [BAND] Computing cluster score bands vs teacher embedding...")
+    for cid in range(k):
+        centroid = centroids[cid].reshape(1, -1)
+        sim      = float(cosine_similarity(centroid, teacher_emb)[0][0])
+
+        # Map cosine similarity to a grade band
+        if sim >= 0.80:
+            band       = "Excellent"
+            band_score = round(marks * 1.0, 2)
+        elif sim >= 0.65:
+            band       = "Good"
+            band_score = round(marks * 0.75, 2)
+        elif sim >= 0.50:
+            band       = "Average"
+            band_score = round(marks * 0.55, 2)
+        elif sim >= 0.35:
+            band       = "Below Average"
+            band_score = round(marks * 0.35, 2)
+        else:
+            band       = "Poor"
+            band_score = round(marks * 0.15, 2)
+
+        bands[cid] = {"band": band, "band_score": band_score, "centroid_sim": round(sim, 4)}
+        print(f"     Cluster {cid}: sim={sim:.4f} → {band} ({band_score}/{marks})")
+
+    return bands
+
+
+# =========================
+# 🔹 EVALUATE (batch, Qwen already loaded)
+# =========================
+
+def evaluate_student(student_key_points: list, questions_data: list,
+                     teacher_key_points_cache: dict) -> dict:
+    """
+    Hybrid scoring for one student.
+    teacher_key_points_cache: {question_index: list} — pre-extracted, reused across students.
+    """
     total_score  = 0.0
     max_total    = 0
     per_question = []
 
-    print("━" * 50)
-    print(f"📝 [EVAL] Starting hybrid evaluation for {len(questions_data)} question(s)...")
-    print("━" * 50)
-
     for i, q in enumerate(questions_data):
-        key_answer = q.get("keyAnswer", "")
-        marks      = q.get("marks", 1)
-        max_total += marks
-
-        print(f"\n  📌 Q{i+1} (max={marks})")
-        print(f"  🔑 [EVAL] Extracting teacher key points for Q{i+1}...")
-        teacher_points = qwen_extract_key_points(key_answer)
+        key_answer     = q.get("keyAnswer", "")
+        marks          = q.get("marks", 1)
+        max_total     += marks
+        teacher_points = teacher_key_points_cache.get(i, [])
 
         if not teacher_points:
-            print(f"  ⚠️  [EVAL] No teacher key points extracted for Q{i+1} — scoring as 0.")
             per_question.append({
                 "score": 0, "marks": marks,
-                "remarks": "Could not extract teacher key points.",
+                "remarks": "No teacher key points extracted.",
                 "emb_score": 0, "llm_score": 0,
+                "band": "N/A", "band_score": 0,
             })
             continue
 
-        result = hybrid_score(key_points, teacher_points, key_answer, marks)
+        result       = hybrid_score(student_key_points, teacher_points, key_answer, marks)
         total_score += result["score"]
-
         per_question.append({
             "score":     result["score"],
             "marks":     marks,
@@ -505,10 +552,6 @@ def evaluate_with_hybrid(key_points: list, questions_data: list) -> dict:
             "emb_score": result["emb_score"],
             "llm_score": result["llm_score"],
         })
-
-    print("\n" + "━" * 50)
-    print(f"🏁 [EVAL] Final Score: {round(total_score, 2)}/{max_total}")
-    print("━" * 50)
 
     return {
         "score":        round(total_score, 2),
@@ -518,36 +561,51 @@ def evaluate_with_hybrid(key_points: list, questions_data: list) -> dict:
 
 
 # =========================
-# 🔹 CLUSTER FEEDBACK HELPER
+# 🔹 CLUSTER FEEDBACK
 # =========================
 
-def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
+def generate_cluster_feedback(all_students_data: list, key_answer: str,
+                               teacher_key_points: list, marks: int) -> list:
+    """
+    K-means cluster student answers.
+    1. Assign score bands based on centroid-to-teacher similarity.
+    2. Generate Qwen feedback once per cluster centroid.
+    3. Assign both to every student in the cluster.
+    """
     n = len(all_students_data)
     if n == 0:
         return all_students_data
 
     k = min(N_CLUSTERS, n)
     print("━" * 50)
-    print(f"🔵 [CLUSTER] Clustering {n} student answer(s) into k={k} groups...")
+    print(f"🔵 [CLUSTER] {n} student(s) → k={k} clusters")
 
     embedder = get_embedder()
-    texts    = [s.get("cleaned_text", " ".join(s.get("key_points", []))) for s in all_students_data]
-    embs     = embedder.encode(texts)
+    texts    = [" ".join(s.get("key_points", [])) for s in all_students_data]
+    embs     = embedder.encode(texts)                  # (N, D)
+
+    # Also embed the teacher answer for band comparison
+    teacher_text = " ".join(teacher_key_points) if teacher_key_points else key_answer
+    teacher_emb  = embedder.encode([teacher_text])     # (1, D)
 
     if n == 1:
         labels    = np.array([0])
-        centroids = embs
+        centroids = embs.reshape(1, -1)
     else:
-        kmeans    = KMeans(n_clusters=k, random_state=42, n_init=10).fit(embs)
-        labels    = kmeans.labels_
-        centroids = kmeans.cluster_centers_
+        km        = KMeans(n_clusters=k, random_state=42, n_init=10).fit(embs)
+        labels    = km.labels_
+        centroids = km.cluster_centers_
 
-    print(f"   Cluster distribution: { {int(c): int((labels==c).sum()) for c in range(k)} }")
+    dist_counts = {int(c): int((labels == c).sum()) for c in range(k)}
+    print(f"   Distribution: {dist_counts}")
 
-    cluster_feedbacks = {}
-    qwen, sampling    = get_qwen()
+    # ── Score bands from centroid similarity ─────────────────────────────
+    score_bands = assign_cluster_score_bands(embs, labels, centroids, teacher_emb, marks, k)
 
-    bloom_levels = ["Remember", "Understand", "Apply", "Analyse", "Evaluate", "Create"]
+    # ── Qwen feedback per cluster ─────────────────────────────────────────
+    qwen, sampling = get_qwen()
+    bloom_levels   = ["Remember", "Understand", "Apply", "Analyse", "Evaluate", "Create"]
+    cluster_data   = {}
 
     for cid in range(k):
         members = [i for i, l in enumerate(labels) if l == cid]
@@ -558,14 +616,11 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
         rep_idx = members[int(np.argmin(dists))]
         rep     = all_students_data[rep_idx]
 
-        print(f"\n  🔵 Cluster {cid} — {len(members)} member(s), representative: index {rep_idx}")
+        print(f"\n  🔵 Cluster {cid} ({len(members)} student(s))  rep=index {rep_idx}  band={score_bands[cid]['band']}")
 
-        student_str = (
-            "\n".join(f"- {p}" for p in rep.get("key_points", []))
-            or "(none)"
-        )
+        student_str = "\n".join(f"- {p}" for p in rep.get("key_points", [])) or "(none)"
 
-        # ── Pass A: Strengths / Improvements / Suggestions ────────────────
+        # Pass A: Strengths / Improvements / Suggestions
         prompt_a = (
             "<|im_start|>system\n"
             "You are an expert exam coach. Given a key answer and student key points, "
@@ -580,82 +635,73 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
             f"Student Key Points:\n{student_str}<|im_end|>\n"
             "<|im_start|>assistant\n{"
         )
-
         raw_a    = "{" + qwen.generate([prompt_a], sampling)[0].outputs[0].text
         raw_a    = raw_a.replace("<|im_end|>", "").strip()
         feedback = extract_json(raw_a, dict)
 
         if not feedback:
-            print(f"  ⚠️  [CLUSTER] Feedback JSON parse failed for cluster {cid}.")
+            print(f"  ⚠️  [CLUSTER] Feedback parse failed for cluster {cid}.")
             feedback = {"strengths": [], "improvements": [], "suggestions": []}
         else:
             for key in ["strengths", "improvements", "suggestions"]:
                 if not isinstance(feedback.get(key), list):
                     feedback[key] = []
 
-        print(f"     Strengths    : {len(feedback['strengths'])} items")
-        print(f"     Improvements : {len(feedback['improvements'])} items")
-        print(f"     Suggestions  : {len(feedback['suggestions'])} items")
-
-        # ── Pass B: Bloom's Taxonomy (FIXED) ──────────────────────────────
+        # Pass B: Bloom's Taxonomy
         prompt_b = (
             "<|im_start|>system\n"
             "You are an expert in Bloom's Taxonomy for exam evaluation.\n"
-            "For each of the 6 Bloom's levels, do the following:\n"
-            "1. 'required': Does the KEY ANSWER demand this level? Score 0-100.\n"
-            "   - 0   = not needed at all\n"
-            "   - 50  = partially needed\n"
-            "   - 100 = central to the answer\n"
-            "2. 'demonstrated': Did the STUDENT KEY POINTS show this level? Score 0 to 'required' only.\n"
-            "   - demonstrated CANNOT exceed required.\n"
-            "   - If required=0, demonstrated must also be 0.\n"
-            "Be strict. Most answers only strongly require 2-3 levels.\n"
+            "For each of the 6 Bloom's levels, rate:\n"
+            "1. 'required': how much the KEY ANSWER demands this level (0-100).\n"
+            "2. 'demonstrated': how much the STUDENT showed this level (0 to required max).\n"
+            "demonstrated CANNOT exceed required. Be strict — most answers only require 2-3 levels strongly.\n"
             "Return ONLY a raw JSON array of exactly 6 objects. No prose, no markdown.\n"
             'Format: [{"level":"Remember","required":80,"demonstrated":60}]'
             "<|im_end|>\n"
-            f"<|im_start|>user\n"
-            f"Key Answer:\n{key_answer}\n\n"
-            f"Student Key Points:\n{student_str}\n"
-            "<|im_end|>\n"
+            f"<|im_start|>user\nKey Answer:\n{key_answer}\n\n"
+            f"Student Key Points:\n{student_str}<|im_end|>\n"
             "<|im_start|>assistant\n["
         )
-
         raw_b  = "[" + qwen.generate([prompt_b], sampling)[0].outputs[0].text
         raw_b  = raw_b.replace("<|im_end|>", "").strip()
         blooms = extract_json(raw_b, list)
 
         if not blooms:
-            print(f"  ⚠️  [CLUSTER] Bloom's JSON parse failed for cluster {cid} — using zeros.")
+            print(f"  ⚠️  [CLUSTER] Bloom's parse failed for cluster {cid} — zeros.")
             blooms = [{"level": l, "required": 0, "demonstrated": 0} for l in bloom_levels]
         else:
-            blooms_map = {b.get("level"): b for b in blooms if isinstance(b, dict)}
+            bmap   = {b.get("level"): b for b in blooms if isinstance(b, dict)}
             blooms = []
             for level in bloom_levels:
-                entry = blooms_map.get(level, {})
-                # 🔹 FIX: demonstrated is capped at required
-                req = max(0, min(100, int(entry.get("required", 0))))
-                dem = max(0, min(req, int(entry.get("demonstrated", 0))))
-                blooms.append({
-                    "level":        level,
-                    "required":     req,
-                    "demonstrated": dem,
-                })
-            print(f"     Bloom's: {[(b['level'], b['required'], b['demonstrated']) for b in blooms]}")
+                entry = bmap.get(level, {})
+                req   = max(0, min(100, int(entry.get("required", 0))))
+                dem   = max(0, min(req,  int(entry.get("demonstrated", 0))))
+                blooms.append({"level": level, "required": req, "demonstrated": dem})
 
-        cluster_feedbacks[cid] = {
-            "strengths":    feedback.get("strengths", []),
-            "improvements": feedback.get("improvements", []),
-            "suggestions":  feedback.get("suggestions", []),
-            "blooms":       blooms,
+        print(f"     Strengths={len(feedback['strengths'])}  Improvements={len(feedback['improvements'])}  Suggestions={len(feedback['suggestions'])}")
+        print(f"     Bloom's: {[(b['level'][:3], b['demonstrated']) for b in blooms]}")
+
+        cluster_data[cid] = {
+            "analysis": {
+                "strengths":    feedback.get("strengths", []),
+                "improvements": feedback.get("improvements", []),
+                "suggestions":  feedback.get("suggestions", []),
+                "blooms":       blooms,
+            },
+            "band":      score_bands[cid]["band"],
+            "band_score": score_bands[cid]["band_score"],
         }
 
+    # Assign to every student
     for i, student in enumerate(all_students_data):
-        student["analysis"]   = cluster_feedbacks.get(int(labels[i]), {
-            "strengths": [], "improvements": [], "suggestions": [], "blooms": []
-        })
-        student["cluster_id"] = int(labels[i])
+        cid               = int(labels[i])
+        cdata             = cluster_data.get(cid, {})
+        student["analysis"]   = cdata.get("analysis", {"strengths": [], "improvements": [], "suggestions": [], "blooms": []})
+        student["cluster_id"] = cid
+        student["band"]       = cdata.get("band", "N/A")
+        student["band_score"] = cdata.get("band_score", 0)
 
-    print(f"\n✅ [CLUSTER] Feedback generated for {k} clusters, assigned to {n} student(s).")
+    print(f"\n✅ [CLUSTER] Done — {k} clusters, {n} students assigned.")
     print("━" * 50)
     return all_students_data
 
@@ -670,81 +716,181 @@ async def health():
 
 
 # =========================
-# 🔹 SIMILARITY ENDPOINT
+# 🔹 BATCH SIMILARITY ENDPOINT
+# Accepts multiple answer sheets for the same question set.
+# Pipeline:
+#   Phase 1 — Uni-MuMER: OCR all sheets → cache to disk → unload
+#   Phase 2 — Qwen: clean + extract + score all from cache → unload
+#   Phase 3 — Clustering: assign score bands + generate batch feedback
 # =========================
 
 @app.post("/similarity")
 async def similarity(
     request: Request,
-    questions: str  = Form(...),
-    answer_sheets: List[UploadFile] = File(...)
+    questions: str = Form(...),
+    answer_sheets: List[UploadFile] = File(...),
+    student_names: str = Form(default="[]"),   # JSON array of names, optional
 ):
     request_start = time.time()
 
     try:
         print("\n" + "═" * 60)
-        print("🚀 [REQUEST] /similarity — new request received")
+        print("🚀 [REQUEST] /similarity — batch pipeline start")
         print("═" * 60)
 
         questions_data = json.loads(questions)
+        names_list     = json.loads(student_names)
+
+        # Pad / generate student names
+        sheet_names = []
+        for idx in range(len(answer_sheets)):
+            if idx < len(names_list) and names_list[idx].strip():
+                sheet_names.append(names_list[idx].strip())
+            else:
+                sheet_names.append(answer_sheets[idx].filename or f"Student_{idx+1}")
+
         print(f"   Questions     : {len(questions_data)}")
         print(f"   Answer sheets : {len(answer_sheets)}")
+        print(f"   Student names : {sheet_names}")
 
         if not answer_sheets:
             return {"error": "No answer sheets uploaded"}
 
-        results = []
-
-        for sheet_idx, sheet in enumerate(answer_sheets):
-            sheet_start = time.time()
-            print(f"\n{'─'*50}")
-            print(f"📄 [SHEET {sheet_idx+1}/{len(answer_sheets)}] Processing: {sheet.filename}")
-            print(f"{'─'*50}")
-
-            sheet_dir = f"output/sheet_{sheet_idx}"
-            os.makedirs(sheet_dir, exist_ok=True)
-
+        # ── Read all file bytes upfront (async, before any model load) ────
+        all_bytes = []
+        for sheet in answer_sheets:
             content = await sheet.read()
-            images  = convert_from_bytes(content)
-            print(f"   Pages in PDF  : {len(images)}")
+            all_bytes.append(content)
 
-            # ── STAGE 1: Uni-MuMER OCR ────────────────────────────────────
-            unimer_result = run_unimer_on_images(images)
-            raw_text      = unimer_result.get("raw_text", "")
+        # ═══════════════════════════════════════════════════
+        # PHASE 1 — UNI-MuMER: OCR all sheets
+        # ═══════════════════════════════════════════════════
+        print("\n" + "─" * 60)
+        print("🔍 PHASE 1 — UNI-MuMER OCR (all sheets)")
+        print("─" * 60)
+        phase1_start = time.time()
 
-            # ── STAGE 2: Clean text ───────────────────────────────────────
-            cleaned_text         = qwen_clean_text(raw_text)
-            student_answer_lines = wrap_into_lines(cleaned_text, words_per_line=8)
+        cache_paths = batch_ocr(all_bytes, sheet_names)
 
-            # ── STAGE 3: Extract student key points ───────────────────────
-            key_points = qwen_extract_key_points(cleaned_text)
+        unload_unimer()  # explicitly unload after all OCR is done
+        print(f"⏱️  Phase 1 complete in {time.time()-phase1_start:.1f}s")
 
-            # ── STAGE 4: Hybrid scoring ───────────────────────────────────
-            eval_result = evaluate_with_hybrid(key_points, questions_data)
+        # ═══════════════════════════════════════════════════
+        # PHASE 2 — QWEN: clean + extract + score all sheets
+        # ═══════════════════════════════════════════════════
+        print("\n" + "─" * 60)
+        print("🧠 PHASE 2 — QWEN processing (all sheets)")
+        print("─" * 60)
+        phase2_start = time.time()
 
-            final_result = {
+        # Pre-extract teacher key points ONCE per question (reused for all students)
+        print("\n  📚 [EVAL] Pre-extracting teacher key points...")
+        teacher_kp_cache = {}
+        for i, q in enumerate(questions_data):
+            print(f"    Q{i+1}:")
+            teacher_kp_cache[i] = qwen_extract_key_points(q.get("keyAnswer", ""), label=f"Teacher Q{i+1}")
+
+        # Process each student
+        student_results = []
+        for idx, cache_path in enumerate(cache_paths):
+            name = sheet_names[idx]
+            print(f"\n  {'─'*45}")
+            print(f"  👤 [{idx+1}/{len(cache_paths)}] Processing: {name}")
+            print(f"  {'─'*45}")
+
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+
+            raw_text = cached["raw_text"]
+
+            # Pass 1: clean
+            cleaned_text = qwen_clean_text(raw_text, label=name)
+
+            # Pass 2: extract student key points
+            key_points = qwen_extract_key_points(cleaned_text, label=name)
+
+            # Pass 3: hybrid score
+            print(f"\n  📝 [EVAL] Scoring {name}...")
+            eval_result = evaluate_student(key_points, questions_data, teacher_kp_cache)
+
+            student_results.append({
+                "student_name":   name,
+                "student_index":  idx,
+                "key_points":     key_points,
+                "cleaned_text":   cleaned_text,
+                "student_answer": wrap_into_lines(cleaned_text, words_per_line=8),
                 "score":          eval_result["score"],
                 "total":          eval_result["total"],
-                "student_answer": student_answer_lines,
-                "key_points":     key_points,
                 "per_question":   eval_result["per_question"],
-            }
+            })
 
-            elapsed = time.time() - sheet_start
-            print(f"\n{'═'*60}")
-            print(f"📦 [RESULT] Sheet {sheet_idx+1} complete in {elapsed:.1f}s")
-            print(f"   Score      : {final_result['score']}/{final_result['total']}")
-            print(f"   Key points : {len(key_points)}")
-            print(json.dumps(final_result, indent=2))
-            print("═" * 60)
+            print(f"  ✅ {name}: {eval_result['score']}/{eval_result['total']}")
 
-            results.append(final_result)
-            shutil.rmtree(sheet_dir, ignore_errors=True)
+        print(f"\n⏱️  Phase 2 complete in {time.time()-phase2_start:.1f}s")
 
+        # ═══════════════════════════════════════════════════
+        # PHASE 3 — CLUSTERING: score bands + batch feedback
+        # ═══════════════════════════════════════════════════
+        print("\n" + "─" * 60)
+        print("🔵 PHASE 3 — CLUSTERING & FEEDBACK")
+        print("─" * 60)
+        phase3_start = time.time()
+
+        # Use first question's key answer and teacher points for clustering
+        # (for multi-question papers, clustering on Q1 is standard practice)
+        primary_key_answer    = questions_data[0].get("keyAnswer", "") if questions_data else ""
+        primary_teacher_kp    = teacher_kp_cache.get(0, [])
+        primary_marks         = questions_data[0].get("marks", 1) if questions_data else 1
+
+        student_results = generate_cluster_feedback(
+            student_results,
+            primary_key_answer,
+            primary_teacher_kp,
+            primary_marks,
+        )
+
+        print(f"⏱️  Phase 3 complete in {time.time()-phase3_start:.1f}s")
+
+        # ── Build final response ──────────────────────────────────────────
         total_elapsed = time.time() - request_start
-        print(f"\n🏁 [REQUEST] /similarity complete in {total_elapsed:.1f}s")
 
-        return results[0] if results else {"score": 0, "total": 0}
+        # Summary stats
+        all_scores      = [s["score"] for s in student_results]
+        score_total     = student_results[0]["total"] if student_results else 0
+        avg_score       = round(sum(all_scores) / len(all_scores), 2) if all_scores else 0
+        highest         = max(all_scores) if all_scores else 0
+        lowest          = min(all_scores) if all_scores else 0
+
+        final_response = {
+            "batch_size":    len(student_results),
+            "average_score": avg_score,
+            "highest_score": highest,
+            "lowest_score":  lowest,
+            "total_marks":   score_total,
+            "students":      student_results,
+        }
+
+        print("\n" + "═" * 60)
+        print(f"🏁 [DONE] Batch complete in {total_elapsed:.1f}s")
+        print(f"   Students  : {len(student_results)}")
+        print(f"   Avg score : {avg_score}/{score_total}")
+        print(f"   Highest   : {highest}   Lowest: {lowest}")
+        for s in student_results:
+            print(f"   {s['student_name']:30s} {s['score']}/{s['total']}  [{s.get('band','N/A')}]")
+        print("═" * 60)
+
+        # If only one student, also return flat keys so existing frontend still works
+        if len(student_results) == 1:
+            sr = student_results[0]
+            final_response.update({
+                "score":          sr["score"],
+                "total":          sr["total"],
+                "student_answer": sr["student_answer"],
+                "key_points":     sr["key_points"],
+                "per_question":   sr["per_question"],
+            })
+
+        return final_response
 
     except Exception as e:
         traceback.print_exc()
@@ -754,6 +900,7 @@ async def similarity(
 
 # =========================
 # 🔹 ANALYSE ENDPOINT
+# (single student, called from frontend after evaluation)
 # =========================
 
 @app.post("/analyse")
@@ -762,7 +909,7 @@ async def analyse(request: Request):
 
     try:
         print("\n" + "═" * 60)
-        print("🚀 [REQUEST] /analyse — new request received")
+        print("🚀 [REQUEST] /analyse")
         print("═" * 60)
 
         body       = await request.json()
@@ -770,25 +917,34 @@ async def analyse(request: Request):
         key_points = body.get("keyPoints", [])
         score      = body.get("score", 0)
         total      = body.get("total", 1)
-        remarks    = body.get("remarks", "")
 
-        print(f"   Key answer length : {len(key_answer)} chars")
-        print(f"   Key points        : {len(key_points)}")
-        print(f"   Score             : {score}/{total}")
+        print(f"   Key answer : {len(key_answer)} chars")
+        print(f"   Key points : {len(key_points)}")
+        print(f"   Score      : {score}/{total}")
+
+        # Extract teacher key points for clustering
+        teacher_points = qwen_extract_key_points(key_answer, label="Teacher (analyse)")
 
         student_data = [{
             "key_points":   key_points,
             "cleaned_text": " ".join(key_points),
         }]
 
-        student_data = generate_cluster_feedback(student_data, key_answer)
-        analysis     = student_data[0].get("analysis", {})
+        student_data = generate_cluster_feedback(
+            student_data,
+            key_answer,
+            teacher_points,
+            total,
+        )
 
-        result = {
+        analysis = student_data[0].get("analysis", {})
+        result   = {
             "strengths":    analysis.get("strengths", []),
             "improvements": analysis.get("improvements", []),
             "suggestions":  analysis.get("suggestions", []),
             "blooms":       analysis.get("blooms", []),
+            "band":         student_data[0].get("band", "N/A"),
+            "band_score":   student_data[0].get("band_score", 0),
         }
 
         elapsed = time.time() - request_start
