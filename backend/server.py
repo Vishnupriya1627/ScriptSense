@@ -714,8 +714,8 @@ async def similarity(
                 "per_question":   eval_result["per_question"],
             }
 
-            print(f"\n📝 [RAW OCR] Sheet {sheet_idx+1}:\n{raw_text}", flush=True)
-            print(f"\n🧹 [CLEANED TEXT] Sheet {sheet_idx+1}:\n{cleaned_text}", flush=True)
+            # print(f"\n📝 [RAW OCR] Sheet {sheet_idx+1}:\n{raw_text}", flush=True)
+            # print(f"\n🧹 [CLEANED TEXT] Sheet {sheet_idx+1}:\n{cleaned_text}", flush=True)
             print(f"\n📦 [FINAL JSON] Sheet {sheet_idx+1}:\n{json.dumps(final_result, indent=2)}", flush=True)
 
             elapsed = time.time() - sheet_start
