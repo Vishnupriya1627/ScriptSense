@@ -659,34 +659,46 @@ async def similarity(
         if not answer_sheets:
             return {"error": "No answer sheets uploaded"}
 
-        # ══════════════════════════════════════════════
-        # STAGE 1 — Read all PDFs into memory
-        # ══════════════════════════════════════════════
-        print("\n📂 [STAGE 1] Reading PDFs...")
-        sheets_images = []
+        # ══════════════════════════════════════════════════════════
+        # STAGE 1 — Read ALL PDFs into memory (no model needed)
+        # ══════════════════════════════════════════════════════════
+        print("\n📂 [STAGE 1] Reading all PDFs into memory...")
+        sheets_images   = []
+        sheet_filenames = []
         for sheet in answer_sheets:
             content = await sheet.read()
             images  = convert_from_bytes(content)
             sheets_images.append(images)
+            sheet_filenames.append(sheet.filename)
             print(f"   {sheet.filename}: {len(images)} page(s)")
 
-        # ══════════════════════════════════════════════
-        # STAGE 2 — Uni-MuMER: load once → OCR all → unload
-        # ══════════════════════════════════════════════
-        print("\n🔍 [STAGE 2] Uni-MuMER OCR pass...")
+        # ══════════════════════════════════════════════════════════
+        # STAGE 2 — Uni-MuMER: load ONCE → OCR ALL sheets → unload
+        #
+        #   ocr_all_sheets() handles load + OCR + unload internally.
+        #   After this stage, Uni-MuMER is fully off the GPU.
+        # ══════════════════════════════════════════════════════════
+        print(f"\n🔍 [STAGE 2] Uni-MuMER: OCR all {len(sheets_images)} sheet(s) in one pass...")
         all_raw_texts = ocr_all_sheets(sheets_images)
-        # ✅ Uni-MuMER is unloaded inside ocr_all_sheets()
+        # ✅ Uni-MuMER is already unloaded inside ocr_all_sheets()
 
-        # ══════════════════════════════════════════════
-        # STAGE 3 — Qwen: load once → evaluate all → unload
-        # ══════════════════════════════════════════════
-        print("\n🤖 [STAGE 3] Qwen evaluation pass...")
+        # ══════════════════════════════════════════════════════════
+        # STAGE 3 — Qwen: load ONCE → process ALL sheets → unload
+        #
+        #   We explicitly load Qwen here so it is resident for the
+        #   entire evaluation loop. Every inner call to get_qwen()
+        #   will hit the "already in memory — reusing" branch.
+        #   We unload exactly once after all sheets are done.
+        # ══════════════════════════════════════════════════════════
+        print(f"\n🤖 [STAGE 3] Qwen: evaluating all {len(all_raw_texts)} sheet(s) in one pass...")
+        get_qwen()   # ← load once up-front
+
         results = []
-
         for sheet_idx, raw_text in enumerate(all_raw_texts):
             sheet_start = time.time()
+            fname = sheet_filenames[sheet_idx]
             print(f"\n{'─'*50}")
-            print(f"📄 [SHEET {sheet_idx+1}/{len(all_raw_texts)}]")
+            print(f"📄 [SHEET {sheet_idx+1}/{len(all_raw_texts)}]  {fname}")
             print(f"{'─'*50}")
 
             cleaned_text         = qwen_clean_text(raw_text)
@@ -703,11 +715,11 @@ async def similarity(
             }
 
             elapsed = time.time() - sheet_start
-            print(f"📦 Sheet {sheet_idx+1} done in {elapsed:.1f}s — "
+            print(f"📦 Sheet {sheet_idx+1} ({fname}) done in {elapsed:.1f}s — "
                   f"{final_result['score']}/{final_result['total']}")
             results.append(final_result)
 
-        # ✅ Unload Qwen after all sheets evaluated
+        # ✅ Unload Qwen ONCE after ALL sheets are evaluated
         unload_qwen()
 
         total_elapsed = time.time() - request_start
