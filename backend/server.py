@@ -650,7 +650,7 @@ async def similarity(
 
     try:
         print("\n" + "═" * 60)
-        print("🚀 [REQUEST] /similarity")
+        print("🚀 [REQUEST] /similarity--this is new code")
         print("═" * 60)
 
         questions_data = json.loads(questions)
