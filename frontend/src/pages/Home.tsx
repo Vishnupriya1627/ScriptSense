@@ -275,7 +275,7 @@ export default function Home() {
         },
         {
           headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
-          timeout: 300000,
+          timeout: 600000,
         }
       );
 
