@@ -35,7 +35,7 @@ app.add_middleware(
 sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
-QWEN_MODEL_PATH   = "/content/models/Qwen2.5-3B-Instruct"
+QWEN_MODEL_PATH   = "/content/models/Qwen2.5-VL-3B-Instruct"
 
 EMBEDDING_THRESHOLD = 0.60
 ALPHA               = 0.6
@@ -115,23 +115,48 @@ def get_unimer():
 
 def get_qwen():
     global _qwen_llm, _qwen_sampling
+
+    # unload Uni-MuMER before loading Qwen
     unload_unimer()
+
     if _qwen_llm is None:
+
         print("━" * 50)
-        print("🔄 [MODEL] Loading Qwen2.5-3B-Instruct...")
+        print("🔄 [MODEL] Loading Qwen2.5-VL-3B-Instruct...")
+
         t0 = time.time()
+
         _qwen_llm = LLM(
             model=QWEN_MODEL_PATH,
             trust_remote_code=True,
+
             dtype="float16",
-            gpu_memory_utilization=0.90,
+
+            # 🔧 safer memory usage
+            gpu_memory_utilization=0.85,
+
             max_model_len=4096,
+
+            # 🔧 VERY IMPORTANT for VL model stability
+            # prevents vision memory allocation
+            # since you're using text-only prompts
+            limit_mm_per_prompt={"image": 0}
         )
-        _qwen_sampling = SamplingParams(temperature=0, max_tokens=1024)
-        print(f"✅ [MODEL] Qwen loaded in {time.time()-t0:.1f}s.")
+
+        _qwen_sampling = SamplingParams(
+            temperature=0,
+            max_tokens=1024
+        )
+
+        print(
+            f"✅ [MODEL] Qwen2.5-VL loaded in "
+            f"{time.time()-t0:.1f}s."
+        )
         print("━" * 50)
+
     else:
-        print("⚡ [MODEL] Qwen already in memory — reusing.")
+        print("⚡ [MODEL] Qwen2.5-VL already in memory — reusing.")
+
     return _qwen_llm, _qwen_sampling
 
 
