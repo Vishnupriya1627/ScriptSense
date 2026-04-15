@@ -35,7 +35,7 @@ app.add_middleware(
 sys.path.insert(0, '/content/Uni-MuMER')
 
 UNIMER_MODEL_PATH = "/content/Uni-MuMER/models/Uni-MuMER-3B"
-QWEN_MODEL_PATH   = "/content/models/Qwen2.5-VL-3B-Instruct"
+QWEN_MODEL_PATH   = "/content/models/Qwen2.5-3B-Instruct"
 
 EMBEDDING_THRESHOLD = 0.60
 ALPHA               = 0.6
@@ -786,4 +786,4 @@ async def analyse(request: Request):
     except Exception as e:
         traceback.print_exc()
         print(f"❌ [ERROR] /analyse: {e}")
-        return {"error": str(e)}
+        return {"error": str(e)}  
