@@ -58,6 +58,12 @@ interface BatchResult {
   students: StudentResult[];
 }
 
+// Per-question sheet slot in the UI
+interface SheetSlot {
+  file: File | null;
+  name: string;
+}
+
 // ─────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────
@@ -86,7 +92,6 @@ const BAND_COLORS: Record<string, { bg: string; text: string }> = {
 // Helpers
 // ─────────────────────────────────────────────
 
-/** Convert backend flat result → StudentResult */
 const toStudent = (flat: any, idx: number, name: string): StudentResult => ({
   student_name:   name || flat.student_name || `Student ${idx + 1}`,
   student_index:  idx,
@@ -102,30 +107,24 @@ const toStudent = (flat: any, idx: number, name: string): StudentResult => ({
   band_score:     flat.band_score,
 });
 
-/** Wrap any backend shape into BatchResult */
 const normaliseBatchResult = (data: any, names: string[]): BatchResult => {
-  // ── Case 1: backend returned an array (multiple sheets) ──────────────
   if (Array.isArray(data)) {
     const students = data.map((flat, i) =>
-      toStudent(flat, i, names[i] ?? flat.student_name ?? `Student ${i + 1}`)
+      toStudent(flat, i, flat.student_name ?? names[i] ?? `Student ${i + 1}`)
     );
     const scores = students.map((s) => s.score);
     return {
       batch_size:    students.length,
-      average_score: parseFloat(
-        (scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(2)
-      ),
+      average_score: parseFloat((scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(2)),
       highest_score: Math.max(...scores),
       lowest_score:  Math.min(...scores),
       total_marks:   students[0]?.total ?? 0,
       students,
     };
   }
-
-  // ── Case 2: backend already returned batch shape ──────────────────────
   if (data.students) {
     const students = (data.students as any[]).map((s, i) =>
-      toStudent(s, i, names[i] ?? s.student_name ?? `Student ${i + 1}`)
+      toStudent(s, i, s.student_name ?? names[i] ?? `Student ${i + 1}`)
     );
     return {
       batch_size:    data.batch_size    ?? students.length,
@@ -136,9 +135,7 @@ const normaliseBatchResult = (data: any, names: string[]): BatchResult => {
       students,
     };
   }
-
-  // ── Case 3: single flat result ────────────────────────────────────────
-  const student = toStudent(data, 0, names[0] ?? "Student 1");
+  const student = toStudent(data, 0, data.student_name ?? names[0] ?? "Student 1");
   return {
     batch_size:    1,
     average_score: student.score,
@@ -149,102 +146,6 @@ const normaliseBatchResult = (data: any, names: string[]): BatchResult => {
   };
 };
 
-/**
- * Merge newly returned question results into the existing cumulative BatchResult.
- * For each student in the new batch:
- *   - If they already exist (matched by name), add their new per_question slot
- *     and add the new score on top of the existing score.
- *   - If they are new (first sheet uploaded for them), add them fresh with the
- *     correct total_marks reflecting ALL questions.
- * Re-computes average / highest / lowest from the updated scores.
- */
-const mergeIncomingResults = (
-  existing: BatchResult,
-  incoming: BatchResult,
-  questionIndex: number,
-  allQuestions: Question[]
-): BatchResult => {
-  // Build a mutable copy of existing students keyed by lowercase name
-  const studentMap = new Map<string, StudentResult>();
-  existing.students.forEach((s) => {
-    studentMap.set(s.student_name.trim().toLowerCase(), { ...s, per_question: [...s.per_question] });
-  });
-
-  // Total marks across ALL questions (so the denominator is always correct)
-  const grandTotal = allQuestions.reduce((sum, q) => sum + q.marks, 0);
-
-  incoming.students.forEach((incomingStudent) => {
-    const key = incomingStudent.student_name.trim().toLowerCase();
-
-    if (studentMap.has(key)) {
-      // ── Student already exists — accumulate ──────────────────────────
-      const existing = studentMap.get(key)!;
-
-      // Grow per_question array to fit this question index if needed
-      while (existing.per_question.length <= questionIndex) {
-        existing.per_question.push({ score: 0, marks: 0, remarks: "" });
-      }
-
-      // Write the incoming question result into the right slot
-      const incomingPQ = incomingStudent.per_question[0] ?? {
-        score: incomingStudent.score,
-        marks: allQuestions[questionIndex]?.marks ?? incomingStudent.total,
-        remarks: "",
-      };
-      existing.per_question[questionIndex] = incomingPQ;
-
-      // Sum scores and update total
-      existing.score = parseFloat(
-        (existing.per_question.reduce((sum, pq) => sum + (pq?.score ?? 0), 0)).toFixed(2)
-      );
-      existing.total = grandTotal;
-
-      // Append answer lines & key points for this question
-      existing.student_answer = [...existing.student_answer, ...incomingStudent.student_answer];
-      existing.key_points     = [...existing.key_points,     ...incomingStudent.key_points];
-
-      studentMap.set(key, existing);
-    } else {
-      // ── Brand-new student — build a fresh record ──────────────────────
-      const perQ: PerQuestion[] = allQuestions.map((q, qi) => ({
-        score:   0,
-        marks:   q.marks,
-        remarks: "",
-      }));
-
-      const incomingPQ = incomingStudent.per_question[0] ?? {
-        score: incomingStudent.score,
-        marks: allQuestions[questionIndex]?.marks ?? incomingStudent.total,
-        remarks: "",
-      };
-      perQ[questionIndex] = incomingPQ;
-
-      const freshStudent: StudentResult = {
-        ...incomingStudent,
-        score:        incomingPQ.score,
-        total:        grandTotal,
-        per_question: perQ,
-      };
-
-      studentMap.set(key, freshStudent);
-    }
-  });
-
-  const merged = Array.from(studentMap.values()).map((s, i) => ({ ...s, student_index: i }));
-  const scores = merged.map((s) => s.score);
-
-  return {
-    batch_size:    merged.length,
-    average_score: scores.length
-      ? parseFloat((scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(2))
-      : 0,
-    highest_score: scores.length ? Math.max(...scores) : 0,
-    lowest_score:  scores.length ? Math.min(...scores) : 0,
-    total_marks:   grandTotal,
-    students:      merged,
-  };
-};
-
 // ─────────────────────────────────────────────
 // Sub-components
 // ─────────────────────────────────────────────
@@ -252,10 +153,8 @@ const mergeIncomingResults = (
 const BandBadge = ({ band }: { band: string }) => {
   const c = BAND_COLORS[band] ?? BAND_COLORS["N/A"];
   return (
-    <span
-      className="text-xs font-semibold px-2 py-1 rounded-full"
-      style={{ backgroundColor: c.bg, color: c.text }}
-    >
+    <span className="text-xs font-semibold px-2 py-1 rounded-full"
+      style={{ backgroundColor: c.bg, color: c.text }}>
       {band}
     </span>
   );
@@ -270,16 +169,9 @@ const ScoreRing = ({ score, total }: { score: number; total: number }) => {
   return (
     <svg width="72" height="72" viewBox="0 0 72 72">
       <circle cx="36" cy="36" r={r} fill="none" stroke="#E5E7EB" strokeWidth="6" />
-      <circle
-        cx="36" cy="36" r={r}
-        fill="none"
-        stroke={color}
-        strokeWidth="6"
-        strokeDasharray={`${dash} ${circ - dash}`}
-        strokeLinecap="round"
-        transform="rotate(-90 36 36)"
-        style={{ transition: "stroke-dasharray 0.6s ease" }}
-      />
+      <circle cx="36" cy="36" r={r} fill="none" stroke={color} strokeWidth="6"
+        strokeDasharray={`${dash} ${circ - dash}`} strokeLinecap="round"
+        transform="rotate(-90 36 36)" style={{ transition: "stroke-dasharray 0.6s ease" }} />
       <text x="36" y="40" textAnchor="middle" fontSize="13" fontWeight="600" fill="#0F2854">
         {score}/{total}
       </text>
@@ -301,10 +193,7 @@ const BloomsChart = ({
         <span className="w-3 h-1.5 rounded-sm inline-block bg-gray-300" /> Required
       </span>
       <span className="flex items-center gap-1">
-        <span
-          className="w-3 h-1.5 rounded-sm inline-block"
-          style={{ backgroundColor: "#0F2854" }}
-        />{" "}
+        <span className="w-3 h-1.5 rounded-sm inline-block" style={{ backgroundColor: "#0F2854" }} />{" "}
         Demonstrated
       </span>
     </div>
@@ -314,26 +203,16 @@ const BloomsChart = ({
         return (
           <div key={b.level} className="rounded-lg p-2" style={{ backgroundColor: c.bg }}>
             <div className="flex justify-between text-xs mb-1.5">
-              <span className="font-medium" style={{ color: "#0F2854" }}>
-                {b.level}
-              </span>
-              <span className="text-gray-500">
-                {b.demonstrated}% / {b.required}%
-              </span>
+              <span className="font-medium" style={{ color: "#0F2854" }}>{b.level}</span>
+              <span className="text-gray-500">{b.demonstrated}% / {b.required}%</span>
             </div>
-            {/* Required track */}
             <div className="w-full bg-gray-200 rounded-full h-1.5 mb-1">
-              <div
-                className="h-1.5 rounded-full bg-gray-400 transition-all duration-500"
-                style={{ width: `${b.required}%` }}
-              />
+              <div className="h-1.5 rounded-full bg-gray-400 transition-all duration-500"
+                style={{ width: `${b.required}%` }} />
             </div>
-            {/* Demonstrated track */}
             <div className="w-full bg-gray-200 rounded-full h-1.5">
-              <div
-                className="h-1.5 rounded-full transition-all duration-500"
-                style={{ width: `${b.demonstrated}%`, backgroundColor: c.bar }}
-              />
+              <div className="h-1.5 rounded-full transition-all duration-500"
+                style={{ width: `${b.demonstrated}%`, backgroundColor: c.bar }} />
             </div>
           </div>
         );
@@ -342,16 +221,11 @@ const BloomsChart = ({
   </div>
 );
 
-// ─────────────────────────────────────────────
-// Student Answer display
-// ─────────────────────────────────────────────
-
 const StudentAnswerPanel = ({ lines }: { lines: string[] }) => {
   const [expanded, setExpanded] = useState(false);
   const fullText = lines.join(" ");
   const preview  = fullText.slice(0, 320);
   const isTrunc  = fullText.length > 320;
-
   return (
     <div className="mb-5">
       <div className="flex items-center justify-between mb-2">
@@ -359,19 +233,15 @@ const StudentAnswerPanel = ({ lines }: { lines: string[] }) => {
           📄 Extracted &amp; Cleaned Answer
         </p>
         {isTrunc && (
-          <button
-            onClick={() => setExpanded((v) => !v)}
+          <button onClick={() => setExpanded((v) => !v)}
             className="text-xs px-2 py-0.5 rounded-full border transition-colors"
-            style={{ borderColor: "#BDE8F5", color: "#0F2854" }}
-          >
+            style={{ borderColor: "#BDE8F5", color: "#0F2854" }}>
             {expanded ? "Show less" : "Show full"}
           </button>
         )}
       </div>
-      <div
-        className="bg-gray-50 border border-gray-100 rounded-xl p-4 text-sm leading-relaxed text-gray-700 whitespace-pre-wrap"
-        style={{ fontFamily: "'Georgia', serif" }}
-      >
+      <div className="bg-gray-50 border border-gray-100 rounded-xl p-4 text-sm leading-relaxed text-gray-700 whitespace-pre-wrap"
+        style={{ fontFamily: "'Georgia', serif" }}>
         {expanded || !isTrunc ? fullText : preview + (isTrunc ? "…" : "")}
       </div>
     </div>
@@ -383,28 +253,24 @@ const StudentAnswerPanel = ({ lines }: { lines: string[] }) => {
 // ─────────────────────────────────────────────
 
 export default function Home() {
-  // ── Setup state ──────────────────────────────
+  // ── Setup ──────────────────────────────────────
   const [numQuestions, setNumQuestions]       = useState(0);
   const [questions, setQuestions]             = useState<Question[]>([]);
   const [isSetupComplete, setIsSetupComplete] = useState(false);
   const [currentPage, setCurrentPage]         = useState(0);
 
-  // ── Student sheets ────────────────────────────
-  const [studentSheets, setStudentSheets] = useState<{ file: File | null; name: string }[]>([
-    { file: null, name: "" },
-  ]);
+  // ── Per-question sheet slots ───────────────────
+  // sheetsPerQuestion[qi] = array of {file, name} for question qi
+  const [sheetsPerQuestion, setSheetsPerQuestion] = useState<SheetSlot[][]>([]);
 
-  // ── Results ───────────────────────────────────
+  // ── Results ────────────────────────────────────
   const [batchResult, setBatchResult]               = useState<BatchResult | null>(null);
   const [selectedStudentIdx, setSelectedStudentIdx] = useState(0);
   const [analysingIndex, setAnalysingIndex]         = useState<number | null>(null);
 
-  // ── Loading ───────────────────────────────────
+  // ── Loading ────────────────────────────────────
   const [loading, setLoading]           = useState(false);
   const [loadingStage, setLoadingStage] = useState("");
-
-  // ── Track which questions have been evaluated ──
-  const [evaluatedQuestions, setEvaluatedQuestions] = useState<Set<number>>(new Set());
 
   // ═════════════════════════════════════════════
   // SETUP
@@ -416,15 +282,13 @@ export default function Home() {
     if (!n || n < 1) return;
     setQuestions(
       Array.from({ length: n }, (_, i) => ({
-        id:            i + 1,
-        keyAnswer:     "",
-        keyDiagram:    null,
-        keyDiagramName:"Add diagram",
-        marks:         0,
-        textWeight:    1.0,
-        diagramWeight: 0.0,
+        id: i + 1, keyAnswer: "", keyDiagram: null,
+        keyDiagramName: "Add diagram", marks: 0,
+        textWeight: 1.0, diagramWeight: 0.0,
       }))
     );
+    // One empty slot per question to start
+    setSheetsPerQuestion(Array.from({ length: n }, () => [{ file: null, name: "" }]));
     setIsSetupComplete(true);
     setCurrentPage(0);
   };
@@ -435,86 +299,118 @@ export default function Home() {
 
   const handleQuestionChange = (index: number, field: keyof Question, value: any) => {
     setQuestions((prev) => {
-      const updated = [...prev];
-      updated[index] = { ...updated[index], [field]: value };
-      return updated;
+      const u = [...prev];
+      u[index] = { ...u[index], [field]: value };
+      return u;
     });
   };
 
   // ═════════════════════════════════════════════
-  // STUDENT SHEET HANDLERS
+  // SHEET SLOT HANDLERS (per question)
   // ═════════════════════════════════════════════
 
-  const addStudentSlot = () =>
-    setStudentSheets((p) => [...p, { file: null, name: "" }]);
-
-  const removeStudentSlot = (idx: number) =>
-    setStudentSheets((p) => p.filter((_, i) => i !== idx));
-
-  const updateStudentSheet = (idx: number, file: File | null) =>
-    setStudentSheets((p) => {
-      const u = [...p];
-      u[idx]  = { ...u[idx], file };
+  const addSlot = (qi: number) => {
+    setSheetsPerQuestion((prev) => {
+      const u = [...prev];
+      u[qi] = [...u[qi], { file: null, name: "" }];
       return u;
     });
+  };
 
-  const updateStudentName = (idx: number, name: string) =>
-    setStudentSheets((p) => {
-      const u = [...p];
-      u[idx]  = { ...u[idx], name };
+  const removeSlot = (qi: number, slotIdx: number) => {
+    setSheetsPerQuestion((prev) => {
+      const u = [...prev];
+      u[qi] = u[qi].filter((_, i) => i !== slotIdx);
       return u;
     });
+  };
+
+  const updateSlotFile = (qi: number, slotIdx: number, file: File | null) => {
+    setSheetsPerQuestion((prev) => {
+      const u = prev.map((q) => [...q]);
+      u[qi][slotIdx] = { ...u[qi][slotIdx], file };
+      return u;
+    });
+  };
+
+  const updateSlotName = (qi: number, slotIdx: number, name: string) => {
+    setSheetsPerQuestion((prev) => {
+      const u = prev.map((q) => [...q]);
+      u[qi][slotIdx] = { ...u[qi][slotIdx], name };
+      return u;
+    });
+  };
 
   // ═════════════════════════════════════════════
-  // EVALUATION
+  // EVALUATION — send everything at once
   // ═════════════════════════════════════════════
 
   const evaluateAll = async () => {
-    const q = questions[currentPage];
-    if (!q.keyAnswer.trim()) {
-      alert(`Q${currentPage + 1}: Please enter an answer key`);
-      return;
-    }
-    if (q.marks <= 0) {
-      alert(`Q${currentPage + 1}: Please enter valid marks`);
-      return;
+    // Validate all questions
+    for (let i = 0; i < questions.length; i++) {
+      if (!questions[i].keyAnswer.trim()) {
+        alert(`Q${i + 1}: Please enter an answer key`);
+        setCurrentPage(i);
+        return;
+      }
+      if (questions[i].marks <= 0) {
+        alert(`Q${i + 1}: Please enter valid marks`);
+        setCurrentPage(i);
+        return;
+      }
     }
 
-    const validSheets = studentSheets.filter((s) => s.file !== null);
-    if (validSheets.length === 0) {
-      alert("Please upload at least one student answer sheet");
-      return;
+    // Validate at least one sheet per question
+    for (let i = 0; i < questions.length; i++) {
+      const hasSheet = sheetsPerQuestion[i]?.some((s) => s.file !== null);
+      if (!hasSheet) {
+        alert(`Q${i + 1}: Please upload at least one student sheet`);
+        setCurrentPage(i);
+        return;
+      }
     }
 
     setLoading(true);
-    // ── DO NOT reset batchResult here — we accumulate ──
+    setBatchResult(null);
 
     try {
       const formData = new FormData();
 
-      // Send only the current question's data to the backend
+      // All question metadata
       formData.append(
         "questions",
-        JSON.stringify([
-          {
+        JSON.stringify(
+          questions.map((q) => ({
             keyAnswer:     q.keyAnswer,
             marks:         q.marks,
             textWeight:    q.textWeight,
             diagramWeight: q.diagramWeight,
-          },
-        ])
+          }))
+        )
       );
 
-      if (q.keyDiagram) {
-        formData.append(`key_diagram_0`, q.keyDiagram);
-      }
-
-      const names: string[] = [];
-      validSheets.forEach((s, i) => {
-        formData.append("answer_sheets", s.file as File);
-        names.push(s.name.trim() || `Student_${i + 1}`);
+      // Optional key diagrams
+      questions.forEach((q, i) => {
+        if (q.keyDiagram) formData.append(`key_diagram_${i}`, q.keyDiagram);
       });
-      formData.append("student_names", JSON.stringify(names));
+
+      // Build flat sheet list with metadata
+      // sheet_meta[i] tells the backend: which question + which student name for answer_sheets[i]
+      const sheetMeta: { question_index: number; student_name: string }[] = [];
+
+      sheetsPerQuestion.forEach((slots, qi) => {
+        slots.forEach((slot, si) => {
+          if (slot.file) {
+            formData.append("answer_sheets", slot.file);
+            sheetMeta.push({
+              question_index: qi,
+              student_name:   slot.name.trim() || `Student_${si + 1}`,
+            });
+          }
+        });
+      });
+
+      formData.append("sheet_meta", JSON.stringify(sheetMeta));
 
       setLoadingStage("📄 Stage 1/3 — Uni-MuMER reading handwriting...");
 
@@ -526,9 +422,7 @@ export default function Home() {
         timeout: 1_200_000,
         onUploadProgress: (e) => {
           if (e.total) {
-            setLoadingStage(
-              `📤 Uploading... ${Math.round((e.loaded * 100) / e.total)}%`
-            );
+            setLoadingStage(`📤 Uploading... ${Math.round((e.loaded * 100) / e.total)}%`);
           }
         },
       });
@@ -537,58 +431,13 @@ export default function Home() {
       const raw = response.data;
       console.log("✅ Raw backend response:", raw);
 
-      const incoming = normaliseBatchResult(raw, names);
-      console.log("✅ Normalised incoming result:", incoming);
+      // Backend returns merged-by-student array or batch shape
+      const uniqueNames = Array.from(new Set(sheetMeta.map((m) => m.student_name)));
+      const normalised  = normaliseBatchResult(raw, uniqueNames);
+      console.log("✅ Normalised batch result:", normalised);
 
-      if (batchResult === null) {
-        // ── First question ever evaluated ────────────────────────────────
-        // Build a full per_question array sized to all questions
-        const grandTotal = questions.reduce((sum, qq) => sum + qq.marks, 0);
-        const studentsWithFullPQ = incoming.students.map((s) => {
-          const perQ: PerQuestion[] = questions.map((qq, qi) => ({
-            score:   0,
-            marks:   qq.marks,
-            remarks: "",
-          }));
-          // Slot in what the backend returned for this question
-          const incomingPQ = s.per_question[0] ?? { score: s.score, marks: q.marks, remarks: "" };
-          perQ[currentPage] = incomingPQ;
-          return {
-            ...s,
-            score:        parseFloat(perQ.reduce((sum, pq) => sum + pq.score, 0).toFixed(2)),
-            total:        grandTotal,
-            per_question: perQ,
-          };
-        });
-
-        const scores = studentsWithFullPQ.map((s) => s.score);
-        const firstBatch: BatchResult = {
-          batch_size:    studentsWithFullPQ.length,
-          average_score: scores.length
-            ? parseFloat((scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(2))
-            : 0,
-          highest_score: scores.length ? Math.max(...scores) : 0,
-          lowest_score:  scores.length ? Math.min(...scores) : 0,
-          total_marks:   grandTotal,
-          students:      studentsWithFullPQ,
-        };
-        setBatchResult(firstBatch);
-        setSelectedStudentIdx(0);
-      } else {
-        // ── Subsequent question — merge into existing results ────────────
-        const merged = mergeIncomingResults(batchResult, incoming, currentPage, questions);
-        console.log("✅ Merged cumulative result:", merged);
-        setBatchResult(merged);
-      }
-
-      // Mark this question as evaluated
-      setEvaluatedQuestions((prev) => new Set(prev).add(currentPage));
-
-      // ── Clear file slots after success, keep names for convenience ──
-      setStudentSheets((prev) =>
-        prev.map((s) => ({ ...s, file: null }))
-      );
-
+      setBatchResult(normalised);
+      setSelectedStudentIdx(0);
     } catch (error: any) {
       console.error("❌ Evaluation failed:", error);
       alert(`Evaluation failed: ${error.message}`);
@@ -607,21 +456,19 @@ export default function Home() {
     const student = batchResult.students[studentIdx];
     if (!student) return;
 
-    // Toggle close
     if (student.analysisOpen && student.analysis) {
       setBatchResult((prev) => {
         if (!prev) return prev;
-        const u       = [...prev.students];
+        const u = [...prev.students];
         u[studentIdx] = { ...u[studentIdx], analysisOpen: false };
         return { ...prev, students: u };
       });
       return;
     }
 
-    // Open panel
     setBatchResult((prev) => {
       if (!prev) return prev;
-      const u       = [...prev.students];
+      const u = [...prev.students];
       u[studentIdx] = { ...u[studentIdx], analysisOpen: true };
       return { ...prev, students: u };
     });
@@ -652,7 +499,7 @@ export default function Home() {
       const data: Analysis = response.data;
       setBatchResult((prev) => {
         if (!prev) return prev;
-        const u       = [...prev.students];
+        const u = [...prev.students];
         u[studentIdx] = {
           ...u[studentIdx],
           analysis:     data,
@@ -667,7 +514,7 @@ export default function Home() {
       alert(`Analysis failed: ${error.message}`);
       setBatchResult((prev) => {
         if (!prev) return prev;
-        const u       = [...prev.students];
+        const u = [...prev.students];
         u[studentIdx] = { ...u[studentIdx], analysisOpen: false };
         return { ...prev, students: u };
       });
@@ -682,35 +529,24 @@ export default function Home() {
 
   if (!isSetupComplete) {
     return (
-      <div
-        className="w-screen h-screen flex items-center justify-center"
-        style={{ backgroundColor: "#BDE8F5" }}
-      >
+      <div className="w-screen h-screen flex items-center justify-center"
+        style={{ backgroundColor: "#BDE8F5" }}>
         <div className="bg-white p-12 rounded-2xl shadow-lg w-96">
-          <h1 className="text-3xl font-light mb-2" style={{ color: "#0F2854" }}>
-            ScriptSense
-          </h1>
+          <h1 className="text-3xl font-light mb-2" style={{ color: "#0F2854" }}>ScriptSense</h1>
           <p className="text-sm text-gray-400 mb-8">AI-powered answer sheet evaluator</p>
           <form onSubmit={handleNumQuestionsSubmit} className="space-y-6">
             <div className="space-y-2">
               <label className="text-sm uppercase tracking-wider" style={{ color: "#0F2854" }}>
                 Number of Questions
               </label>
-              <input
-                type="number"
-                min="1"
-                value={numQuestions || ""}
+              <input type="number" min="1" value={numQuestions || ""}
                 onChange={(e) => setNumQuestions(parseInt(e.target.value) || 0)}
                 className="w-full p-3 border border-gray-200 rounded-md outline-none focus:border-blue-300 transition-colors"
-                placeholder="e.g., 5"
-                autoFocus
-              />
+                placeholder="e.g., 5" autoFocus />
             </div>
-            <button
-              type="submit"
+            <button type="submit"
               className="w-full py-3 text-sm uppercase tracking-wider transition-colors rounded-md"
-              style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}
-            >
+              style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}>
               Start
             </button>
           </form>
@@ -719,10 +555,12 @@ export default function Home() {
     );
   }
 
-  const currentQuestion  = questions[currentPage];
-  const selectedStudent  = batchResult?.students[selectedStudentIdx];
-  const uploadedCount    = studentSheets.filter((s) => s.file).length;
-  const isCurrentQEvaluated = evaluatedQuestions.has(currentPage);
+  const currentQuestion = questions[currentPage];
+  const currentSlots    = sheetsPerQuestion[currentPage] ?? [];
+  const totalSheets     = sheetsPerQuestion.reduce(
+    (sum, slots) => sum + slots.filter((s) => s.file).length, 0
+  );
+  const selectedStudent = batchResult?.students[selectedStudentIdx];
 
   // ═════════════════════════════════════════════
   // RENDER — MAIN
@@ -737,11 +575,7 @@ export default function Home() {
         <span className="text-sm text-gray-400">
           {questions.length} question{questions.length !== 1 ? "s" : ""}
           &nbsp;·&nbsp;
-          {uploadedCount} sheet{uploadedCount !== 1 ? "s" : ""} uploaded
-          &nbsp;·&nbsp;
-          <span style={{ color: "#0F2854", fontWeight: 500 }}>
-            {evaluatedQuestions.size}/{questions.length} evaluated
-          </span>
+          {totalSheets} sheet{totalSheets !== 1 ? "s" : ""} ready
         </span>
       </div>
 
@@ -755,78 +589,62 @@ export default function Home() {
             <h2 className="text-xs uppercase tracking-wider mb-3 text-gray-400">Questions</h2>
             <div className="space-y-1">
               {questions.map((q, idx) => {
-                const isActive      = idx === currentPage;
-                const isIncomplete  = !q.keyAnswer.trim() || q.marks <= 0;
-                const isDone        = evaluatedQuestions.has(idx);
+                const isActive     = idx === currentPage;
+                const isIncomplete = !q.keyAnswer.trim() || q.marks <= 0;
+                const sheetCount   = sheetsPerQuestion[idx]?.filter((s) => s.file).length ?? 0;
                 return (
-                  <button
-                    key={q.id}
-                    onClick={() => setCurrentPage(idx)}
+                  <button key={q.id} onClick={() => setCurrentPage(idx)}
                     className={`w-full p-2 rounded-lg text-left text-sm flex items-center justify-between transition-all ${
                       isActive ? "ring-2" : "hover:bg-gray-50"
                     }`}
-                    style={{ backgroundColor: isActive ? "#BDE8F5" : "white" }}
-                  >
-                    <span style={{ color: "#0F2854" }}>
-                      Q{q.id} — {q.marks || "?"} marks
-                    </span>
-                    {isDone ? (
-                      <span className="text-xs px-1.5 py-0.5 bg-green-100 text-green-700 rounded-full">
-                        ✓
-                      </span>
-                    ) : isIncomplete ? (
-                      <span className="text-xs px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded-full">
-                        !
-                      </span>
-                    ) : null}
+                    style={{ backgroundColor: isActive ? "#BDE8F5" : "white" }}>
+                    <span style={{ color: "#0F2854" }}>Q{q.id} — {q.marks || "?"} marks</span>
+                    <div className="flex items-center gap-1">
+                      {sheetCount > 0 && (
+                        <span className="text-xs px-1.5 py-0.5 bg-blue-100 text-blue-600 rounded-full">
+                          {sheetCount}
+                        </span>
+                      )}
+                      {isIncomplete && (
+                        <span className="text-xs px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded-full">!
+                        </span>
+                      )}
+                    </div>
                   </button>
                 );
               })}
             </div>
           </div>
 
-          {/* Student sheets */}
+          {/* Student sheets for current question */}
           <div className="bg-white rounded-2xl shadow-sm p-4 flex flex-col flex-1 overflow-hidden">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs uppercase tracking-wider text-gray-400">
-                Student Sheets
-                <span className="ml-1 normal-case text-gray-300">— Q{currentPage + 1}</span>
-              </h2>
-              <button
-                onClick={addStudentSlot}
+            <div className="flex items-center justify-between mb-1">
+              <h2 className="text-xs uppercase tracking-wider text-gray-400">Student Sheets</h2>
+              <button onClick={() => addSlot(currentPage)}
                 className="text-xs px-2 py-1 rounded-lg"
-                style={{ backgroundColor: "#BDE8F5", color: "#0F2854" }}
-              >
+                style={{ backgroundColor: "#BDE8F5", color: "#0F2854" }}>
                 + Add
               </button>
             </div>
+            <p className="text-xs text-gray-300 mb-3">for Q{currentPage + 1}</p>
 
             <div className="flex-1 overflow-y-auto space-y-2">
-              {studentSheets.map((s, idx) => (
-                <div key={idx} className="border border-gray-100 rounded-xl p-3 space-y-2">
-                  <input
-                    type="text"
-                    value={s.name}
-                    onChange={(e) => updateStudentName(idx, e.target.value)}
-                    placeholder={`Student ${idx + 1} name`}
-                    className="w-full text-xs p-1.5 border border-gray-200 rounded-md outline-none focus:border-blue-300"
-                  />
+              {currentSlots.map((s, slotIdx) => (
+                <div key={slotIdx} className="border border-gray-100 rounded-xl p-3 space-y-2">
+                  <input type="text" value={s.name}
+                    onChange={(e) => updateSlotName(currentPage, slotIdx, e.target.value)}
+                    placeholder={`Student ${slotIdx + 1} name`}
+                    className="w-full text-xs p-1.5 border border-gray-200 rounded-md outline-none focus:border-blue-300" />
 
                   {!s.file ? (
                     <>
-                      <input
-                        type="file"
-                        id={`sheet-${idx}`}
-                        accept=".pdf,.jpg,.png"
-                        className="hidden"
+                      <input type="file" id={`sheet-${currentPage}-${slotIdx}`}
+                        accept=".pdf,.jpg,.png" className="hidden"
                         onChange={(e) =>
-                          updateStudentSheet(idx, e.target.files?.[0] || null)
-                        }
-                      />
-                      <label
-                        htmlFor={`sheet-${idx}`}
-                        className="flex items-center justify-center gap-1 w-full py-2 border-2 border-dashed border-gray-200 rounded-lg cursor-pointer hover:border-gray-300 text-xs text-gray-400"
-                      >
+                          updateSlotFile(currentPage, slotIdx, e.target.files?.[0] || null)
+                        } />
+                      <label htmlFor={`sheet-${currentPage}-${slotIdx}`}
+                        className="flex items-center justify-center gap-1 w-full py-2 border-2 border-dashed border-gray-200 rounded-lg cursor-pointer hover:border-gray-300 text-xs text-gray-400">
                         + Upload sheet
                       </label>
                     </>
@@ -836,20 +654,14 @@ export default function Home() {
                         <span className="text-green-500 text-sm">✓</span>
                         <span className="text-xs truncate text-gray-600">{s.file.name}</span>
                       </div>
-                      <button
-                        onClick={() => updateStudentSheet(idx, null)}
-                        className="text-xs text-red-400 hover:text-red-600 ml-1 shrink-0"
-                      >
-                        ✕
-                      </button>
+                      <button onClick={() => updateSlotFile(currentPage, slotIdx, null)}
+                        className="text-xs text-red-400 hover:text-red-600 ml-1 shrink-0">✕</button>
                     </div>
                   )}
 
-                  {studentSheets.length > 1 && (
-                    <button
-                      onClick={() => removeStudentSlot(idx)}
-                      className="text-xs text-gray-400 hover:text-red-500 w-full text-center"
-                    >
+                  {currentSlots.length > 1 && (
+                    <button onClick={() => removeSlot(currentPage, slotIdx)}
+                      className="text-xs text-gray-400 hover:text-red-500 w-full text-center">
                       Remove slot
                     </button>
                   )}
@@ -857,28 +669,18 @@ export default function Home() {
               ))}
             </div>
 
-            {/* Evaluate button — shows which question is being evaluated */}
-            <button
-              onClick={evaluateAll}
-              disabled={loading}
+            {/* Single Evaluate All button */}
+            <button onClick={evaluateAll} disabled={loading}
               className="mt-3 w-full py-2.5 text-sm font-medium rounded-xl transition-colors disabled:opacity-50"
-              style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}
-            >
+              style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}>
               {loading
                 ? loadingStage || "Processing..."
-                : isCurrentQEvaluated
-                ? `Re-evaluate Q${currentPage + 1}`
-                : `Evaluate Q${currentPage + 1} — ${uploadedCount} Sheet${uploadedCount !== 1 ? "s" : ""}`}
+                : `Evaluate All — ${totalSheets} Sheet${totalSheets !== 1 ? "s" : ""}`}
             </button>
 
-            {/* Progress hint */}
             {!loading && (
               <p className="text-center text-xs text-gray-400 mt-2">
-                {evaluatedQuestions.size === 0
-                  ? "Upload sheets for the current question and evaluate"
-                  : evaluatedQuestions.size < questions.length
-                  ? `${questions.length - evaluatedQuestions.size} question(s) remaining`
-                  : "✅ All questions evaluated"}
+                Upload sheets per question, then evaluate all at once
               </p>
             )}
           </div>
@@ -893,51 +695,30 @@ export default function Home() {
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-xl font-light" style={{ color: "#0F2854" }}>
                 Question {currentQuestion.id}
-                {isCurrentQEvaluated && (
-                  <span className="ml-2 text-xs font-normal px-2 py-0.5 bg-green-100 text-green-700 rounded-full">
-                    Evaluated
-                  </span>
-                )}
               </h2>
               <div className="flex items-center gap-3">
                 <label className="text-sm" style={{ color: "#0F2854" }}>Marks:</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={currentQuestion.marks || ""}
+                <input type="number" min="0" value={currentQuestion.marks || ""}
                   onChange={(e) =>
                     handleQuestionChange(currentPage, "marks", parseInt(e.target.value) || 0)
                   }
-                  className="w-20 p-2 border border-gray-200 rounded-md text-center outline-none focus:border-blue-300"
-                />
+                  className="w-20 p-2 border border-gray-200 rounded-md text-center outline-none focus:border-blue-300" />
                 <div className="flex gap-2">
-                  <button
-                    onClick={() => setCurrentPage((p) => Math.max(0, p - 1))}
+                  <button onClick={() => setCurrentPage((p) => Math.max(0, p - 1))}
                     disabled={currentPage === 0}
                     className="px-3 py-1 text-sm border border-gray-200 rounded-lg disabled:opacity-30 hover:bg-gray-50"
-                    style={{ color: "#0F2854" }}
-                  >
-                    ←
-                  </button>
-                  <button
-                    onClick={() =>
-                      setCurrentPage((p) => Math.min(questions.length - 1, p + 1))
-                    }
+                    style={{ color: "#0F2854" }}>←</button>
+                  <button onClick={() => setCurrentPage((p) => Math.min(questions.length - 1, p + 1))}
                     disabled={currentPage === questions.length - 1}
                     className="px-3 py-1 text-sm border border-gray-200 rounded-lg disabled:opacity-30 hover:bg-gray-50"
-                    style={{ color: "#0F2854" }}
-                  >
-                    →
-                  </button>
+                    style={{ color: "#0F2854" }}>→</button>
                 </div>
               </div>
             </div>
-            <textarea
-              value={currentQuestion.keyAnswer}
+            <textarea value={currentQuestion.keyAnswer}
               onChange={(e) => handleQuestionChange(currentPage, "keyAnswer", e.target.value)}
               className="w-full h-28 p-3 bg-gray-50 border border-gray-200 rounded-lg text-sm outline-none focus:border-blue-300 resize-none"
-              placeholder="Enter model answer for this question..."
-            />
+              placeholder="Enter model answer for this question..." />
           </div>
 
           {/* ── RESULTS ──────────────────────────────────── */}
@@ -948,9 +729,7 @@ export default function Home() {
               <div className="bg-white rounded-2xl shadow-sm p-4 flex items-center gap-6 shrink-0">
                 <div>
                   <p className="text-xs text-gray-400">Students</p>
-                  <p className="text-2xl font-light" style={{ color: "#0F2854" }}>
-                    {batchResult.batch_size}
-                  </p>
+                  <p className="text-2xl font-light" style={{ color: "#0F2854" }}>{batchResult.batch_size}</p>
                 </div>
                 <div className="h-10 w-px bg-gray-100" />
                 <div>
@@ -971,26 +750,18 @@ export default function Home() {
                   <p className="text-xl font-light text-red-400">{batchResult.lowest_score}</p>
                 </div>
                 <div className="h-10 w-px bg-gray-100" />
-                {/* Mini bar chart */}
                 <div className="flex-1 flex items-end gap-1 h-10">
                   {batchResult.students.map((s, i) => {
                     const pct    = batchResult.total_marks > 0
-                      ? (s.score / batchResult.total_marks) * 100
-                      : 0;
+                      ? (s.score / batchResult.total_marks) * 100 : 0;
                     const active = i === selectedStudentIdx;
                     return (
-                      <button
-                        key={i}
-                        onClick={() => setSelectedStudentIdx(i)}
+                      <button key={i} onClick={() => setSelectedStudentIdx(i)}
                         title={`${s.student_name}: ${s.score}/${s.total}`}
                         className={`flex-1 rounded-t transition-all ${
                           active ? "opacity-100" : "opacity-40 hover:opacity-70"
                         }`}
-                        style={{
-                          height:          `${Math.max(8, pct)}%`,
-                          backgroundColor: "#0F2854",
-                        }}
-                      />
+                        style={{ height: `${Math.max(8, pct)}%`, backgroundColor: "#0F2854" }} />
                     );
                   })}
                 </div>
@@ -1001,24 +772,18 @@ export default function Home() {
 
                 {/* Student list */}
                 <div className="w-52 bg-white rounded-2xl shadow-sm p-3 overflow-y-auto shrink-0">
-                  <p className="text-xs uppercase tracking-wider mb-2 px-1 text-gray-400">
-                    Results
-                  </p>
+                  <p className="text-xs uppercase tracking-wider mb-2 px-1 text-gray-400">Results</p>
                   {batchResult.students.map((s, i) => {
                     const isActive   = i === selectedStudentIdx;
                     const pct        = batchResult.total_marks > 0
-                      ? Math.round((s.score / batchResult.total_marks) * 100)
-                      : 0;
+                      ? Math.round((s.score / batchResult.total_marks) * 100) : 0;
                     const scoreColor = pct >= 75 ? "#22C55E" : pct >= 50 ? "#F59E0B" : "#F43F5E";
                     return (
-                      <button
-                        key={i}
-                        onClick={() => setSelectedStudentIdx(i)}
+                      <button key={i} onClick={() => setSelectedStudentIdx(i)}
                         className={`w-full p-2.5 rounded-xl text-left mb-1 transition-all ${
                           isActive ? "ring-2" : "hover:bg-gray-50"
                         }`}
-                        style={{ backgroundColor: isActive ? "#EFF6FF" : "white" }}
-                      >
+                        style={{ backgroundColor: isActive ? "#EFF6FF" : "white" }}>
                         <p className="text-sm font-medium truncate" style={{ color: "#0F2854" }}>
                           {s.student_name}
                         </p>
@@ -1030,10 +795,8 @@ export default function Home() {
                           {s.band && <BandBadge band={s.band} />}
                         </div>
                         <div className="w-full bg-gray-100 rounded-full h-1 mt-1.5">
-                          <div
-                            className="h-1 rounded-full transition-all duration-500"
-                            style={{ width: `${pct}%`, backgroundColor: scoreColor }}
-                          />
+                          <div className="h-1 rounded-full transition-all duration-500"
+                            style={{ width: `${pct}%`, backgroundColor: scoreColor }} />
                         </div>
                       </button>
                     );
@@ -1044,7 +807,7 @@ export default function Home() {
                 {selectedStudent && (
                   <div className="flex-1 bg-white rounded-2xl shadow-sm p-5 overflow-y-auto min-w-0">
 
-                    {/* Header row */}
+                    {/* Header */}
                     <div className="flex items-start justify-between mb-5">
                       <div className="flex items-center gap-4">
                         <ScoreRing score={selectedStudent.score} total={selectedStudent.total} />
@@ -1055,15 +818,9 @@ export default function Home() {
                           <div className="flex items-center gap-2 mt-1">
                             {(() => {
                               const pct   = selectedStudent.total > 0
-                                ? (selectedStudent.score / selectedStudent.total) * 100
-                                : 0;
-                              const label = pct >= 75
-                                ? "Excellent"
-                                : pct >= 60
-                                ? "Good"
-                                : pct >= 40
-                                ? "Average"
-                                : "Below Average";
+                                ? (selectedStudent.score / selectedStudent.total) * 100 : 0;
+                              const label = pct >= 75 ? "Excellent" : pct >= 60 ? "Good"
+                                : pct >= 40 ? "Average" : "Below Average";
                               return <BandBadge band={selectedStudent.band ?? label} />;
                             })()}
                             {selectedStudent.cluster_id !== undefined && (
@@ -1074,12 +831,10 @@ export default function Home() {
                           </div>
                         </div>
                       </div>
-                      <button
-                        onClick={() => performAnalysis(selectedStudentIdx)}
+                      <button onClick={() => performAnalysis(selectedStudentIdx)}
                         disabled={analysingIndex === selectedStudentIdx}
                         className="px-4 py-2 text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
-                        style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}
-                      >
+                        style={{ backgroundColor: "#0F2854", color: "#BDE8F5" }}>
                         {analysingIndex === selectedStudentIdx
                           ? "⏳ Analysing..."
                           : selectedStudent.analysisOpen && selectedStudent.analysis
@@ -1088,7 +843,7 @@ export default function Home() {
                       </button>
                     </div>
 
-                    {/* ── Score Breakdown ── */}
+                    {/* Score Breakdown — one row per question */}
                     {selectedStudent.per_question?.length > 0 && (
                       <div className="mb-5">
                         <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">
@@ -1096,62 +851,36 @@ export default function Home() {
                         </p>
                         <div className="space-y-2">
                           {selectedStudent.per_question.map((pq, qi) => {
-                            const isEvaluated = evaluatedQuestions.has(qi);
                             const pct = pq.marks > 0 ? (pq.score / pq.marks) * 100 : 0;
                             const col = pct >= 75 ? "#22C55E" : pct >= 50 ? "#F59E0B" : "#F43F5E";
                             return (
-                              <div
-                                key={qi}
-                                className="rounded-xl border border-gray-100 p-3"
-                                style={{ opacity: isEvaluated ? 1 : 0.4 }}
-                              >
+                              <div key={qi} className="rounded-xl border border-gray-100 p-3">
                                 <div className="flex items-center justify-between mb-1">
                                   <span className="text-sm font-semibold" style={{ color: "#0F2854" }}>
                                     Q{qi + 1}
-                                    {!isEvaluated && (
-                                      <span className="ml-2 text-xs font-normal text-gray-400">
-                                        (pending)
-                                      </span>
-                                    )}
                                   </span>
                                   <div className="flex items-center gap-3">
-                                    {pq.emb_score !== undefined && isEvaluated && (
+                                    {pq.emb_score !== undefined && (
                                       <span className="text-xs text-gray-400">
-                                        Emb{" "}
-                                        <span className="font-medium text-gray-600">
-                                          {pq.emb_score}
-                                        </span>
+                                        Emb <span className="font-medium text-gray-600">{pq.emb_score}</span>
                                       </span>
                                     )}
-                                    {pq.llm_score !== undefined && isEvaluated && (
+                                    {pq.llm_score !== undefined && (
                                       <span className="text-xs text-gray-400">
-                                        LLM{" "}
-                                        <span className="font-medium text-gray-600">
-                                          {pq.llm_score}
-                                        </span>
+                                        LLM <span className="font-medium text-gray-600">{pq.llm_score}</span>
                                       </span>
                                     )}
-                                    <span
-                                      className="text-sm font-bold"
-                                      style={{ color: isEvaluated ? col : "#9CA3AF" }}
-                                    >
-                                      {isEvaluated ? `${pq.score}/${pq.marks}` : `—/${pq.marks}`}
+                                    <span className="text-sm font-bold" style={{ color: col }}>
+                                      {pq.score}/{pq.marks}
                                     </span>
                                   </div>
                                 </div>
                                 <div className="w-full bg-gray-100 rounded-full h-2 mb-2">
-                                  <div
-                                    className="h-2 rounded-full transition-all duration-500"
-                                    style={{
-                                      width:           isEvaluated ? `${pct}%` : "0%",
-                                      backgroundColor: col,
-                                    }}
-                                  />
+                                  <div className="h-2 rounded-full transition-all duration-500"
+                                    style={{ width: `${pct}%`, backgroundColor: col }} />
                                 </div>
-                                {pq.remarks && isEvaluated && (
-                                  <p className="text-xs text-gray-500 leading-relaxed">
-                                    {pq.remarks}
-                                  </p>
+                                {pq.remarks && (
+                                  <p className="text-xs text-gray-500 leading-relaxed">{pq.remarks}</p>
                                 )}
                               </div>
                             );
@@ -1160,12 +889,12 @@ export default function Home() {
                       </div>
                     )}
 
-                    {/* ── Extracted & Cleaned Answer ── */}
+                    {/* Extracted Answer */}
                     {selectedStudent.student_answer?.length > 0 && (
                       <StudentAnswerPanel lines={selectedStudent.student_answer} />
                     )}
 
-                    {/* ── Key Points ── */}
+                    {/* Key Points */}
                     {selectedStudent.key_points?.length > 0 && (
                       <div className="mb-5">
                         <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">
@@ -1173,15 +902,8 @@ export default function Home() {
                         </p>
                         <div className="flex flex-wrap gap-2">
                           {selectedStudent.key_points.map((kp, i) => (
-                            <span
-                              key={i}
-                              className="text-xs px-3 py-1 rounded-full border"
-                              style={{
-                                backgroundColor: "#EFF6FF",
-                                borderColor:     "#BFDBFE",
-                                color:           "#1D4ED8",
-                              }}
-                            >
+                            <span key={i} className="text-xs px-3 py-1 rounded-full border"
+                              style={{ backgroundColor: "#EFF6FF", borderColor: "#BFDBFE", color: "#1D4ED8" }}>
                               {kp}
                             </span>
                           ))}
@@ -1189,7 +911,7 @@ export default function Home() {
                       </div>
                     )}
 
-                    {/* ── Analysis Panel ── */}
+                    {/* Analysis Panel */}
                     {selectedStudent.analysisOpen && (
                       <div className="border border-gray-100 rounded-2xl overflow-hidden mt-2">
                         <div className="px-5 py-3" style={{ backgroundColor: "#0F2854" }}>
@@ -1197,61 +919,46 @@ export default function Home() {
                             📊 Deep Answer Analysis
                           </h4>
                         </div>
-
                         {!selectedStudent.analysis ? (
                           <div className="p-8 text-center text-gray-400 text-sm">
-                            <div
-                              className="w-8 h-8 border-4 border-gray-200 border-t-blue-500 rounded-full animate-spin mx-auto mb-3"
-                              style={{ borderTopColor: "#0F2854" }}
-                            />
+                            <div className="w-8 h-8 border-4 border-gray-200 border-t-blue-500 rounded-full animate-spin mx-auto mb-3"
+                              style={{ borderTopColor: "#0F2854" }} />
                             Generating analysis… this may take 1–2 minutes
                           </div>
                         ) : (
                           <div className="p-5 grid grid-cols-2 gap-5">
-                            {/* Feedback */}
                             <div className="space-y-3">
                               <div className="bg-green-50 border border-green-100 rounded-xl p-3">
-                                <p className="text-xs font-semibold text-green-700 uppercase tracking-wider mb-2">
-                                  ✅ Strengths
-                                </p>
+                                <p className="text-xs font-semibold text-green-700 uppercase tracking-wider mb-2">✅ Strengths</p>
                                 <ul className="space-y-1.5">
                                   {selectedStudent.analysis.strengths.map((s, i) => (
                                     <li key={i} className="text-sm text-green-800 flex gap-2">
-                                      <span className="shrink-0">•</span>
-                                      <span>{s}</span>
+                                      <span className="shrink-0">•</span><span>{s}</span>
                                     </li>
                                   ))}
                                 </ul>
                               </div>
                               <div className="bg-red-50 border border-red-100 rounded-xl p-3">
-                                <p className="text-xs font-semibold text-red-700 uppercase tracking-wider mb-2">
-                                  ⚠️ Needs Improvement
-                                </p>
+                                <p className="text-xs font-semibold text-red-700 uppercase tracking-wider mb-2">⚠️ Needs Improvement</p>
                                 <ul className="space-y-1.5">
                                   {selectedStudent.analysis.improvements.map((s, i) => (
                                     <li key={i} className="text-sm text-red-800 flex gap-2">
-                                      <span className="shrink-0">•</span>
-                                      <span>{s}</span>
+                                      <span className="shrink-0">•</span><span>{s}</span>
                                     </li>
                                   ))}
                                 </ul>
                               </div>
                               <div className="bg-blue-50 border border-blue-100 rounded-xl p-3">
-                                <p className="text-xs font-semibold text-blue-700 uppercase tracking-wider mb-2">
-                                  💡 Suggestions
-                                </p>
+                                <p className="text-xs font-semibold text-blue-700 uppercase tracking-wider mb-2">💡 Suggestions</p>
                                 <ul className="space-y-1.5">
                                   {selectedStudent.analysis.suggestions.map((s, i) => (
                                     <li key={i} className="text-sm text-blue-800 flex gap-2">
-                                      <span className="shrink-0">•</span>
-                                      <span>{s}</span>
+                                      <span className="shrink-0">•</span><span>{s}</span>
                                     </li>
                                   ))}
                                 </ul>
                               </div>
                             </div>
-
-                            {/* Bloom's */}
                             <div className="bg-gray-50 rounded-xl p-4">
                               <BloomsChart blooms={selectedStudent.analysis.blooms} />
                             </div>
@@ -1271,12 +978,10 @@ export default function Home() {
             <div className="flex-1 bg-white rounded-2xl shadow-sm flex items-center justify-center">
               <div className="text-center text-gray-400">
                 <p className="text-4xl mb-3">📝</p>
-                <p className="text-sm">Fill in the answer key for Q{currentPage + 1}, upload student sheets,</p>
+                <p className="text-sm">Fill in answer keys for all questions,</p>
+                <p className="text-sm mt-1">upload student sheets per question using the sidebar,</p>
                 <p className="text-sm mt-1">
-                  then click <strong className="text-gray-600">Evaluate Q{currentPage + 1}</strong> to begin.
-                </p>
-                <p className="text-sm mt-1 text-gray-300">
-                  Switch questions using the sidebar and evaluate each one in turn.
+                  then click <strong className="text-gray-600">Evaluate All</strong>.
                 </p>
               </div>
             </div>
@@ -1286,10 +991,8 @@ export default function Home() {
           {loading && (
             <div className="flex-1 bg-white rounded-2xl shadow-sm flex items-center justify-center">
               <div className="text-center">
-                <div
-                  className="w-12 h-12 border-4 border-gray-100 rounded-full animate-spin mx-auto mb-4"
-                  style={{ borderTopColor: "#0F2854" }}
-                />
+                <div className="w-12 h-12 border-4 border-gray-100 rounded-full animate-spin mx-auto mb-4"
+                  style={{ borderTopColor: "#0F2854" }} />
                 <p className="text-sm font-medium" style={{ color: "#0F2854" }}>
                   {loadingStage || "Processing..."}
                 </p>

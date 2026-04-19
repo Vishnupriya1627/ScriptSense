@@ -35,7 +35,6 @@ async def add_ngrok_skip_header(request: Request, call_next):
     response.headers["ngrok-skip-browser-warning"] = "true"
     return response
 
-    
 # =========================
 # 🔹 PATHS
 # =========================
@@ -456,50 +455,30 @@ def hybrid_score(student_points: list, teacher_points: list,
 
 
 # =========================
-# 🔹 EVALUATE
+# 🔹 EVALUATE ONE SHEET AGAINST ONE QUESTION
 # =========================
 
-def evaluate_with_hybrid(key_points: list, questions_data: list) -> dict:
-    total_score  = 0.0
-    max_total    = 0
-    per_question = []
+def evaluate_one(key_points: list, question_data: dict) -> dict:
+    """Score a single student's key points against a single question."""
+    key_answer = question_data.get("keyAnswer", "")
+    marks      = question_data.get("marks", 1)
 
-    print("━" * 50)
-    print(f"📝 [EVAL] {len(questions_data)} question(s)...")
-    print("━" * 50)
+    print(f"\n  📌 Scoring against question (max={marks})")
+    teacher_points = qwen_extract_key_points(key_answer)
 
-    for i, q in enumerate(questions_data):
-        key_answer = q.get("keyAnswer", "")
-        marks      = q.get("marks", 1)
-        max_total += marks
+    if not teacher_points:
+        print(f"  ⚠️  No teacher key points — scoring as 0.")
+        return {"score": 0, "marks": marks, "remarks": "Could not extract teacher key points.",
+                "emb_score": 0, "llm_score": 0}
 
-        print(f"\n  📌 Q{i+1} (max={marks})")
-        teacher_points = qwen_extract_key_points(key_answer)
-
-        if not teacher_points:
-            print(f"  ⚠️  No teacher key points for Q{i+1} — scoring as 0.")
-            per_question.append({
-                "score": 0, "marks": marks,
-                "remarks": "Could not extract teacher key points.",
-                "emb_score": 0, "llm_score": 0,
-            })
-            continue
-
-        result = hybrid_score(key_points, teacher_points, key_answer, marks)
-        total_score += result["score"]
-        per_question.append({
-            "score":     result["score"],
-            "marks":     marks,
-            "remarks":   result["remarks"],
-            "emb_score": result["emb_score"],
-            "llm_score": result["llm_score"],
-        })
-
-    print("\n" + "━" * 50)
-    print(f"🏁 [EVAL] Final: {round(total_score, 2)}/{max_total}")
-    print("━" * 50)
-
-    return {"score": round(total_score, 2), "total": max_total, "per_question": per_question}
+    result = hybrid_score(key_points, teacher_points, key_answer, marks)
+    return {
+        "score":     result["score"],
+        "marks":     marks,
+        "remarks":   result["remarks"],
+        "emb_score": result["emb_score"],
+        "llm_score": result["llm_score"],
+    }
 
 
 # =========================
@@ -545,7 +524,6 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
         print(f"\n  🔵 Cluster {cid} — {len(members)} member(s), rep: index {rep_idx}")
         student_str = "\n".join(f"- {p}" for p in rep.get("key_points", [])) or "(none)"
 
-        # ── Pass A: Strengths / Improvements / Suggestions ────────────────
         prompt_a = (
             "<|im_start|>system\n"
             "You are an expert exam coach. Given a key answer and student key points, "
@@ -576,7 +554,6 @@ def generate_cluster_feedback(all_students_data: list, key_answer: str) -> list:
         print(f"     S:{len(feedback['strengths'])} I:{len(feedback['improvements'])} "
               f"Sg:{len(feedback['suggestions'])}")
 
-        # ── Pass B: Bloom's Taxonomy ───────────────────────────────────────
         prompt_b = (
             "<|im_start|>system\n"
             "You are an expert in Bloom's Taxonomy for exam evaluation.\n"
@@ -652,24 +629,30 @@ async def similarity(
     request: Request,
     questions: str  = Form(...),
     answer_sheets: List[UploadFile] = File(...),
-    student_names: str = Form(default="[]"),
+    sheet_meta: str = Form(...),   # JSON: [{question_index, student_name}, ...]
 ):
     request_start = time.time()
 
     try:
         print("\n" + "═" * 60)
-        print("🚀 [REQUEST] /similarity")
+        print("🚀 [REQUEST] /similarity — all-at-once mode")
         print("═" * 60)
 
         questions_data = json.loads(questions)
-        names          = json.loads(student_names)
+        meta_list      = json.loads(sheet_meta)  # [{question_index, student_name}, ...]
+
         print(f"   Questions: {len(questions_data)}  |  Sheets: {len(answer_sheets)}")
+        for i, m in enumerate(meta_list):
+            print(f"   Sheet {i+1}: Q{m['question_index']+1} | {m['student_name']}")
 
         if not answer_sheets:
             return {"error": "No answer sheets uploaded"}
 
+        if len(answer_sheets) != len(meta_list):
+            return {"error": f"Mismatch: {len(answer_sheets)} sheets but {len(meta_list)} meta entries"}
+
         # ══════════════════════════════════════════════════════════
-        # STAGE 1 — Read ALL PDFs into memory (no model needed)
+        # STAGE 1 — Read ALL PDFs into memory
         # ══════════════════════════════════════════════════════════
         print("\n📂 [STAGE 1] Reading all PDFs into memory...")
         sheets_images   = []
@@ -686,53 +669,131 @@ async def similarity(
         # ══════════════════════════════════════════════════════════
         print(f"\n🔍 [STAGE 2] Uni-MuMER: OCR all {len(sheets_images)} sheet(s) in one pass...")
         all_raw_texts = ocr_all_sheets(sheets_images)
+        # ✅ Uni-MuMER is already unloaded inside ocr_all_sheets()
 
         # ══════════════════════════════════════════════════════════
         # STAGE 3 — Qwen: load ONCE → process ALL sheets → unload
+        # We score each sheet only against its assigned question.
+        # Then we group by student name and sum up per_question scores.
         # ══════════════════════════════════════════════════════════
         print(f"\n🤖 [STAGE 3] Qwen: evaluating all {len(all_raw_texts)} sheet(s) in one pass...")
-        get_qwen()   # ← load once up-front
+        get_qwen()  # load once up-front
 
-        results = []
+        # Pre-extract teacher key points for each question ONCE
+        # so we don't repeat for every student
+        print("\n📚 [STAGE 3a] Pre-extracting teacher key points for all questions...")
+        teacher_kp_cache = {}
+        for qi, q in enumerate(questions_data):
+            print(f"   Q{qi+1}...")
+            teacher_kp_cache[qi] = qwen_extract_key_points(q.get("keyAnswer", ""))
+
+        # per_sheet_results[i] = {student_name, question_index, key_points,
+        #                         student_answer, pq_result}
+        per_sheet_results = []
+
         for sheet_idx, raw_text in enumerate(all_raw_texts):
-            sheet_start = time.time()
-            fname       = sheet_filenames[sheet_idx]
-            name        = names[sheet_idx] if sheet_idx < len(names) else f"Student_{sheet_idx+1}"
+            sheet_start  = time.time()
+            meta         = meta_list[sheet_idx]
+            student_name = meta["student_name"]
+            qi           = int(meta["question_index"])
+            qi           = max(0, min(qi, len(questions_data) - 1))  # clamp
+            fname        = sheet_filenames[sheet_idx]
 
             print(f"\n{'─'*50}")
-            print(f"📄 [SHEET {sheet_idx+1}/{len(all_raw_texts)}]  {fname}  ({name})")
+            print(f"📄 [{sheet_idx+1}/{len(all_raw_texts)}] {fname} → Q{qi+1} | {student_name}")
             print(f"{'─'*50}")
 
             cleaned_text         = qwen_clean_text(raw_text)
             student_answer_lines = wrap_into_lines(cleaned_text, words_per_line=8)
             key_points           = qwen_extract_key_points(cleaned_text)
 
-            # questions_data here contains ONLY the current question (sent from frontend)
-            eval_result = evaluate_with_hybrid(key_points, questions_data)
+            # Score only against the assigned question
+            q_data         = questions_data[qi]
+            teacher_points = teacher_kp_cache[qi]
+            marks          = q_data.get("marks", 1)
 
-            final_result = {
-                "student_name":   name,
-                "score":          eval_result["score"],
-                "total":          eval_result["total"],
-                "student_answer": student_answer_lines,
-                "key_points":     key_points,
-                "per_question":   eval_result["per_question"],
-            }
-
-            print(f"\n📦 [FINAL JSON] Sheet {sheet_idx+1}:\n{json.dumps(final_result, indent=2)}", flush=True)
+            if not teacher_points:
+                pq_result = {"score": 0, "marks": marks,
+                             "remarks": "Could not extract teacher key points.",
+                             "emb_score": 0, "llm_score": 0}
+            else:
+                h = hybrid_score(key_points, teacher_points, q_data.get("keyAnswer", ""), marks)
+                pq_result = {
+                    "score":     h["score"],
+                    "marks":     marks,
+                    "remarks":   h["remarks"],
+                    "emb_score": h["emb_score"],
+                    "llm_score": h["llm_score"],
+                }
 
             elapsed = time.time() - sheet_start
-            print(f"📦 Sheet {sheet_idx+1} ({fname}) done in {elapsed:.1f}s — "
-                  f"{final_result['score']}/{final_result['total']}")
-            results.append(final_result)
+            print(f"✅ Sheet done in {elapsed:.1f}s — {pq_result['score']}/{marks}")
 
-        # ✅ Unload Qwen ONCE after ALL sheets are evaluated
+            per_sheet_results.append({
+                "student_name":   student_name,
+                "question_index": qi,
+                "key_points":     key_points,
+                "student_answer": student_answer_lines,
+                "pq_result":      pq_result,
+            })
+
+        # ✅ Unload Qwen ONCE after ALL sheets evaluated
         unload_qwen()
 
-        total_elapsed = time.time() - request_start
-        print(f"\n🏁 [REQUEST] /similarity done in {total_elapsed:.1f}s")
+        # ══════════════════════════════════════════════════════════
+        # STAGE 4 — Merge by student name
+        # Each student gets one entry with per_question[] sized to
+        # all questions. Slots they didn't upload stay as 0.
+        # ══════════════════════════════════════════════════════════
+        print("\n🔀 [STAGE 4] Merging results by student name...")
 
-        return results[0] if len(results) == 1 else results
+        total_marks = sum(q.get("marks", 0) for q in questions_data)
+
+        # Use ordered dict to preserve first-seen order
+        student_map: dict = {}
+
+        for res in per_sheet_results:
+            key  = res["student_name"].strip().lower()
+            name = res["student_name"]
+            qi   = res["question_index"]
+
+            if key not in student_map:
+                # Initialise with zero per_question slots for every question
+                student_map[key] = {
+                    "student_name":   name,
+                    "score":          0.0,
+                    "total":          total_marks,
+                    "student_answer": [],
+                    "key_points":     [],
+                    "per_question": [
+                        {"score": 0, "marks": q.get("marks", 1),
+                         "remarks": "", "emb_score": 0, "llm_score": 0}
+                        for q in questions_data
+                    ],
+                }
+
+            entry = student_map[key]
+            # Slot in this question's result
+            entry["per_question"][qi] = res["pq_result"]
+            # Accumulate score
+            entry["score"] = round(
+                sum(pq["score"] for pq in entry["per_question"]), 2
+            )
+            # Append answer lines and key points
+            entry["student_answer"] += res["student_answer"]
+            entry["key_points"]     += res["key_points"]
+
+        students = list(student_map.values())
+        scores   = [s["score"] for s in students]
+
+        response_data = students  # return as flat array — frontend normaliseBatchResult handles it
+
+        total_elapsed = time.time() - request_start
+        print(f"\n🏁 [REQUEST] /similarity done in {total_elapsed:.1f}s — "
+              f"{len(students)} unique student(s)")
+        print("═" * 60)
+
+        return response_data
 
     except Exception as e:
         traceback.print_exc()
