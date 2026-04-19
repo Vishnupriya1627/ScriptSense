@@ -29,6 +29,13 @@ app.add_middleware(
     max_age=3600,
 )
 
+@app.middleware("http")
+async def add_ngrok_skip_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["ngrok-skip-browser-warning"] = "true"
+    return response
+
+    
 # =========================
 # 🔹 PATHS
 # =========================
