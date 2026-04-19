@@ -149,6 +149,102 @@ const normaliseBatchResult = (data: any, names: string[]): BatchResult => {
   };
 };
 
+/**
+ * Merge newly returned question results into the existing cumulative BatchResult.
+ * For each student in the new batch:
+ *   - If they already exist (matched by name), add their new per_question slot
+ *     and add the new score on top of the existing score.
+ *   - If they are new (first sheet uploaded for them), add them fresh with the
+ *     correct total_marks reflecting ALL questions.
+ * Re-computes average / highest / lowest from the updated scores.
+ */
+const mergeIncomingResults = (
+  existing: BatchResult,
+  incoming: BatchResult,
+  questionIndex: number,
+  allQuestions: Question[]
+): BatchResult => {
+  // Build a mutable copy of existing students keyed by lowercase name
+  const studentMap = new Map<string, StudentResult>();
+  existing.students.forEach((s) => {
+    studentMap.set(s.student_name.trim().toLowerCase(), { ...s, per_question: [...s.per_question] });
+  });
+
+  // Total marks across ALL questions (so the denominator is always correct)
+  const grandTotal = allQuestions.reduce((sum, q) => sum + q.marks, 0);
+
+  incoming.students.forEach((incomingStudent) => {
+    const key = incomingStudent.student_name.trim().toLowerCase();
+
+    if (studentMap.has(key)) {
+      // ── Student already exists — accumulate ──────────────────────────
+      const existing = studentMap.get(key)!;
+
+      // Grow per_question array to fit this question index if needed
+      while (existing.per_question.length <= questionIndex) {
+        existing.per_question.push({ score: 0, marks: 0, remarks: "" });
+      }
+
+      // Write the incoming question result into the right slot
+      const incomingPQ = incomingStudent.per_question[0] ?? {
+        score: incomingStudent.score,
+        marks: allQuestions[questionIndex]?.marks ?? incomingStudent.total,
+        remarks: "",
+      };
+      existing.per_question[questionIndex] = incomingPQ;
+
+      // Sum scores and update total
+      existing.score = parseFloat(
+        (existing.per_question.reduce((sum, pq) => sum + (pq?.score ?? 0), 0)).toFixed(2)
+      );
+      existing.total = grandTotal;
+
+      // Append answer lines & key points for this question
+      existing.student_answer = [...existing.student_answer, ...incomingStudent.student_answer];
+      existing.key_points     = [...existing.key_points,     ...incomingStudent.key_points];
+
+      studentMap.set(key, existing);
+    } else {
+      // ── Brand-new student — build a fresh record ──────────────────────
+      const perQ: PerQuestion[] = allQuestions.map((q, qi) => ({
+        score:   0,
+        marks:   q.marks,
+        remarks: "",
+      }));
+
+      const incomingPQ = incomingStudent.per_question[0] ?? {
+        score: incomingStudent.score,
+        marks: allQuestions[questionIndex]?.marks ?? incomingStudent.total,
+        remarks: "",
+      };
+      perQ[questionIndex] = incomingPQ;
+
+      const freshStudent: StudentResult = {
+        ...incomingStudent,
+        score:        incomingPQ.score,
+        total:        grandTotal,
+        per_question: perQ,
+      };
+
+      studentMap.set(key, freshStudent);
+    }
+  });
+
+  const merged = Array.from(studentMap.values()).map((s, i) => ({ ...s, student_index: i }));
+  const scores = merged.map((s) => s.score);
+
+  return {
+    batch_size:    merged.length,
+    average_score: scores.length
+      ? parseFloat((scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(2))
+      : 0,
+    highest_score: scores.length ? Math.max(...scores) : 0,
+    lowest_score:  scores.length ? Math.min(...scores) : 0,
+    total_marks:   grandTotal,
+    students:      merged,
+  };
+};
+
 // ─────────────────────────────────────────────
 // Sub-components
 // ─────────────────────────────────────────────
@@ -307,6 +403,9 @@ export default function Home() {
   const [loading, setLoading]           = useState(false);
   const [loadingStage, setLoadingStage] = useState("");
 
+  // ── Track which questions have been evaluated ──
+  const [evaluatedQuestions, setEvaluatedQuestions] = useState<Set<number>>(new Set());
+
   // ═════════════════════════════════════════════
   // SETUP
   // ═════════════════════════════════════════════
@@ -371,17 +470,14 @@ export default function Home() {
   // ═════════════════════════════════════════════
 
   const evaluateAll = async () => {
-    for (let i = 0; i < questions.length; i++) {
-      if (!questions[i].keyAnswer.trim()) {
-        alert(`Q${i + 1}: Please enter an answer key`);
-        setCurrentPage(i);
-        return;
-      }
-      if (questions[i].marks <= 0) {
-        alert(`Q${i + 1}: Please enter valid marks`);
-        setCurrentPage(i);
-        return;
-      }
+    const q = questions[currentPage];
+    if (!q.keyAnswer.trim()) {
+      alert(`Q${currentPage + 1}: Please enter an answer key`);
+      return;
+    }
+    if (q.marks <= 0) {
+      alert(`Q${currentPage + 1}: Please enter valid marks`);
+      return;
     }
 
     const validSheets = studentSheets.filter((s) => s.file !== null);
@@ -391,29 +487,27 @@ export default function Home() {
     }
 
     setLoading(true);
-    setBatchResult(null);
+    // ── DO NOT reset batchResult here — we accumulate ──
 
     try {
       const formData = new FormData();
 
+      // Send only the current question's data to the backend
       formData.append(
         "questions",
-        JSON.stringify(
-          questions.map((q) => ({
+        JSON.stringify([
+          {
             keyAnswer:     q.keyAnswer,
             marks:         q.marks,
             textWeight:    q.textWeight,
             diagramWeight: q.diagramWeight,
-          }))
-        )
+          },
+        ])
       );
 
-      // Append optional key diagrams
-      questions.forEach((q, i) => {
-        if (q.keyDiagram) {
-          formData.append(`key_diagram_${i}`, q.keyDiagram);
-        }
-      });
+      if (q.keyDiagram) {
+        formData.append(`key_diagram_0`, q.keyDiagram);
+      }
 
       const names: string[] = [];
       validSheets.forEach((s, i) => {
@@ -443,11 +537,58 @@ export default function Home() {
       const raw = response.data;
       console.log("✅ Raw backend response:", raw);
 
-      const normalised = normaliseBatchResult(raw, names);
-      console.log("✅ Normalised batch result:", normalised);
+      const incoming = normaliseBatchResult(raw, names);
+      console.log("✅ Normalised incoming result:", incoming);
 
-      setBatchResult(normalised);
-      setSelectedStudentIdx(0);
+      if (batchResult === null) {
+        // ── First question ever evaluated ────────────────────────────────
+        // Build a full per_question array sized to all questions
+        const grandTotal = questions.reduce((sum, qq) => sum + qq.marks, 0);
+        const studentsWithFullPQ = incoming.students.map((s) => {
+          const perQ: PerQuestion[] = questions.map((qq, qi) => ({
+            score:   0,
+            marks:   qq.marks,
+            remarks: "",
+          }));
+          // Slot in what the backend returned for this question
+          const incomingPQ = s.per_question[0] ?? { score: s.score, marks: q.marks, remarks: "" };
+          perQ[currentPage] = incomingPQ;
+          return {
+            ...s,
+            score:        parseFloat(perQ.reduce((sum, pq) => sum + pq.score, 0).toFixed(2)),
+            total:        grandTotal,
+            per_question: perQ,
+          };
+        });
+
+        const scores = studentsWithFullPQ.map((s) => s.score);
+        const firstBatch: BatchResult = {
+          batch_size:    studentsWithFullPQ.length,
+          average_score: scores.length
+            ? parseFloat((scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(2))
+            : 0,
+          highest_score: scores.length ? Math.max(...scores) : 0,
+          lowest_score:  scores.length ? Math.min(...scores) : 0,
+          total_marks:   grandTotal,
+          students:      studentsWithFullPQ,
+        };
+        setBatchResult(firstBatch);
+        setSelectedStudentIdx(0);
+      } else {
+        // ── Subsequent question — merge into existing results ────────────
+        const merged = mergeIncomingResults(batchResult, incoming, currentPage, questions);
+        console.log("✅ Merged cumulative result:", merged);
+        setBatchResult(merged);
+      }
+
+      // Mark this question as evaluated
+      setEvaluatedQuestions((prev) => new Set(prev).add(currentPage));
+
+      // ── Clear file slots after success, keep names for convenience ──
+      setStudentSheets((prev) =>
+        prev.map((s) => ({ ...s, file: null }))
+      );
+
     } catch (error: any) {
       console.error("❌ Evaluation failed:", error);
       alert(`Evaluation failed: ${error.message}`);
@@ -547,7 +688,7 @@ export default function Home() {
       >
         <div className="bg-white p-12 rounded-2xl shadow-lg w-96">
           <h1 className="text-3xl font-light mb-2" style={{ color: "#0F2854" }}>
-            AutoChecker
+            ScriptSense
           </h1>
           <p className="text-sm text-gray-400 mb-8">AI-powered answer sheet evaluator</p>
           <form onSubmit={handleNumQuestionsSubmit} className="space-y-6">
@@ -581,6 +722,7 @@ export default function Home() {
   const currentQuestion  = questions[currentPage];
   const selectedStudent  = batchResult?.students[selectedStudentIdx];
   const uploadedCount    = studentSheets.filter((s) => s.file).length;
+  const isCurrentQEvaluated = evaluatedQuestions.has(currentPage);
 
   // ═════════════════════════════════════════════
   // RENDER — MAIN
@@ -591,11 +733,15 @@ export default function Home() {
 
       {/* HEADER */}
       <div className="h-16 bg-white shadow-sm flex items-center justify-between px-8 shrink-0">
-        <h1 className="text-xl font-light" style={{ color: "#0F2854" }}>AutoChecker</h1>
+        <h1 className="text-xl font-light" style={{ color: "#0F2854" }}>ScriptSense</h1>
         <span className="text-sm text-gray-400">
           {questions.length} question{questions.length !== 1 ? "s" : ""}
           &nbsp;·&nbsp;
           {uploadedCount} sheet{uploadedCount !== 1 ? "s" : ""} uploaded
+          &nbsp;·&nbsp;
+          <span style={{ color: "#0F2854", fontWeight: 500 }}>
+            {evaluatedQuestions.size}/{questions.length} evaluated
+          </span>
         </span>
       </div>
 
@@ -609,8 +755,9 @@ export default function Home() {
             <h2 className="text-xs uppercase tracking-wider mb-3 text-gray-400">Questions</h2>
             <div className="space-y-1">
               {questions.map((q, idx) => {
-                const isActive     = idx === currentPage;
-                const isIncomplete = !q.keyAnswer.trim() || q.marks <= 0;
+                const isActive      = idx === currentPage;
+                const isIncomplete  = !q.keyAnswer.trim() || q.marks <= 0;
+                const isDone        = evaluatedQuestions.has(idx);
                 return (
                   <button
                     key={q.id}
@@ -623,11 +770,15 @@ export default function Home() {
                     <span style={{ color: "#0F2854" }}>
                       Q{q.id} — {q.marks || "?"} marks
                     </span>
-                    {isIncomplete && (
+                    {isDone ? (
+                      <span className="text-xs px-1.5 py-0.5 bg-green-100 text-green-700 rounded-full">
+                        ✓
+                      </span>
+                    ) : isIncomplete ? (
                       <span className="text-xs px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded-full">
                         !
                       </span>
-                    )}
+                    ) : null}
                   </button>
                 );
               })}
@@ -637,7 +788,10 @@ export default function Home() {
           {/* Student sheets */}
           <div className="bg-white rounded-2xl shadow-sm p-4 flex flex-col flex-1 overflow-hidden">
             <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs uppercase tracking-wider text-gray-400">Student Sheets</h2>
+              <h2 className="text-xs uppercase tracking-wider text-gray-400">
+                Student Sheets
+                <span className="ml-1 normal-case text-gray-300">— Q{currentPage + 1}</span>
+              </h2>
               <button
                 onClick={addStudentSlot}
                 className="text-xs px-2 py-1 rounded-lg"
@@ -703,6 +857,7 @@ export default function Home() {
               ))}
             </div>
 
+            {/* Evaluate button — shows which question is being evaluated */}
             <button
               onClick={evaluateAll}
               disabled={loading}
@@ -711,8 +866,21 @@ export default function Home() {
             >
               {loading
                 ? loadingStage || "Processing..."
-                : `Evaluate ${uploadedCount} Sheet${uploadedCount !== 1 ? "s" : ""}`}
+                : isCurrentQEvaluated
+                ? `Re-evaluate Q${currentPage + 1}`
+                : `Evaluate Q${currentPage + 1} — ${uploadedCount} Sheet${uploadedCount !== 1 ? "s" : ""}`}
             </button>
+
+            {/* Progress hint */}
+            {!loading && (
+              <p className="text-center text-xs text-gray-400 mt-2">
+                {evaluatedQuestions.size === 0
+                  ? "Upload sheets for the current question and evaluate"
+                  : evaluatedQuestions.size < questions.length
+                  ? `${questions.length - evaluatedQuestions.size} question(s) remaining`
+                  : "✅ All questions evaluated"}
+              </p>
+            )}
           </div>
 
         </div>
@@ -725,6 +893,11 @@ export default function Home() {
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-xl font-light" style={{ color: "#0F2854" }}>
                 Question {currentQuestion.id}
+                {isCurrentQEvaluated && (
+                  <span className="ml-2 text-xs font-normal px-2 py-0.5 bg-green-100 text-green-700 rounded-full">
+                    Evaluated
+                  </span>
+                )}
               </h2>
               <div className="flex items-center gap-3">
                 <label className="text-sm" style={{ color: "#0F2854" }}>Marks:</label>
@@ -923,16 +1096,26 @@ export default function Home() {
                         </p>
                         <div className="space-y-2">
                           {selectedStudent.per_question.map((pq, qi) => {
+                            const isEvaluated = evaluatedQuestions.has(qi);
                             const pct = pq.marks > 0 ? (pq.score / pq.marks) * 100 : 0;
                             const col = pct >= 75 ? "#22C55E" : pct >= 50 ? "#F59E0B" : "#F43F5E";
                             return (
-                              <div key={qi} className="rounded-xl border border-gray-100 p-3">
+                              <div
+                                key={qi}
+                                className="rounded-xl border border-gray-100 p-3"
+                                style={{ opacity: isEvaluated ? 1 : 0.4 }}
+                              >
                                 <div className="flex items-center justify-between mb-1">
                                   <span className="text-sm font-semibold" style={{ color: "#0F2854" }}>
                                     Q{qi + 1}
+                                    {!isEvaluated && (
+                                      <span className="ml-2 text-xs font-normal text-gray-400">
+                                        (pending)
+                                      </span>
+                                    )}
                                   </span>
                                   <div className="flex items-center gap-3">
-                                    {pq.emb_score !== undefined && (
+                                    {pq.emb_score !== undefined && isEvaluated && (
                                       <span className="text-xs text-gray-400">
                                         Emb{" "}
                                         <span className="font-medium text-gray-600">
@@ -940,7 +1123,7 @@ export default function Home() {
                                         </span>
                                       </span>
                                     )}
-                                    {pq.llm_score !== undefined && (
+                                    {pq.llm_score !== undefined && isEvaluated && (
                                       <span className="text-xs text-gray-400">
                                         LLM{" "}
                                         <span className="font-medium text-gray-600">
@@ -948,18 +1131,24 @@ export default function Home() {
                                         </span>
                                       </span>
                                     )}
-                                    <span className="text-sm font-bold" style={{ color: col }}>
-                                      {pq.score}/{pq.marks}
+                                    <span
+                                      className="text-sm font-bold"
+                                      style={{ color: isEvaluated ? col : "#9CA3AF" }}
+                                    >
+                                      {isEvaluated ? `${pq.score}/${pq.marks}` : `—/${pq.marks}`}
                                     </span>
                                   </div>
                                 </div>
                                 <div className="w-full bg-gray-100 rounded-full h-2 mb-2">
                                   <div
                                     className="h-2 rounded-full transition-all duration-500"
-                                    style={{ width: `${pct}%`, backgroundColor: col }}
+                                    style={{
+                                      width:           isEvaluated ? `${pct}%` : "0%",
+                                      backgroundColor: col,
+                                    }}
                                   />
                                 </div>
-                                {pq.remarks && (
+                                {pq.remarks && isEvaluated && (
                                   <p className="text-xs text-gray-500 leading-relaxed">
                                     {pq.remarks}
                                   </p>
@@ -1082,9 +1271,12 @@ export default function Home() {
             <div className="flex-1 bg-white rounded-2xl shadow-sm flex items-center justify-center">
               <div className="text-center text-gray-400">
                 <p className="text-4xl mb-3">📝</p>
-                <p className="text-sm">Fill in the answer keys, upload student sheets,</p>
+                <p className="text-sm">Fill in the answer key for Q{currentPage + 1}, upload student sheets,</p>
                 <p className="text-sm mt-1">
-                  then click <strong className="text-gray-600">Evaluate</strong> to begin.
+                  then click <strong className="text-gray-600">Evaluate Q{currentPage + 1}</strong> to begin.
+                </p>
+                <p className="text-sm mt-1 text-gray-300">
+                  Switch questions using the sidebar and evaluate each one in turn.
                 </p>
               </div>
             </div>

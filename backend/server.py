@@ -644,16 +644,18 @@ async def health():
 async def similarity(
     request: Request,
     questions: str  = Form(...),
-    answer_sheets: List[UploadFile] = File(...)
+    answer_sheets: List[UploadFile] = File(...),
+    student_names: str = Form(default="[]"),
 ):
     request_start = time.time()
 
     try:
         print("\n" + "═" * 60)
-        print("🚀 [REQUEST] /similarity--this is new code")
+        print("🚀 [REQUEST] /similarity")
         print("═" * 60)
 
         questions_data = json.loads(questions)
+        names          = json.loads(student_names)
         print(f"   Questions: {len(questions_data)}  |  Sheets: {len(answer_sheets)}")
 
         if not answer_sheets:
@@ -674,21 +676,12 @@ async def similarity(
 
         # ══════════════════════════════════════════════════════════
         # STAGE 2 — Uni-MuMER: load ONCE → OCR ALL sheets → unload
-        #
-        #   ocr_all_sheets() handles load + OCR + unload internally.
-        #   After this stage, Uni-MuMER is fully off the GPU.
         # ══════════════════════════════════════════════════════════
         print(f"\n🔍 [STAGE 2] Uni-MuMER: OCR all {len(sheets_images)} sheet(s) in one pass...")
         all_raw_texts = ocr_all_sheets(sheets_images)
-        # ✅ Uni-MuMER is already unloaded inside ocr_all_sheets()
 
         # ══════════════════════════════════════════════════════════
         # STAGE 3 — Qwen: load ONCE → process ALL sheets → unload
-        #
-        #   We explicitly load Qwen here so it is resident for the
-        #   entire evaluation loop. Every inner call to get_qwen()
-        #   will hit the "already in memory — reusing" branch.
-        #   We unload exactly once after all sheets are done.
         # ══════════════════════════════════════════════════════════
         print(f"\n🤖 [STAGE 3] Qwen: evaluating all {len(all_raw_texts)} sheet(s) in one pass...")
         get_qwen()   # ← load once up-front
@@ -696,17 +689,22 @@ async def similarity(
         results = []
         for sheet_idx, raw_text in enumerate(all_raw_texts):
             sheet_start = time.time()
-            fname = sheet_filenames[sheet_idx]
+            fname       = sheet_filenames[sheet_idx]
+            name        = names[sheet_idx] if sheet_idx < len(names) else f"Student_{sheet_idx+1}"
+
             print(f"\n{'─'*50}")
-            print(f"📄 [SHEET {sheet_idx+1}/{len(all_raw_texts)}]  {fname}")
+            print(f"📄 [SHEET {sheet_idx+1}/{len(all_raw_texts)}]  {fname}  ({name})")
             print(f"{'─'*50}")
 
             cleaned_text         = qwen_clean_text(raw_text)
             student_answer_lines = wrap_into_lines(cleaned_text, words_per_line=8)
             key_points           = qwen_extract_key_points(cleaned_text)
-            eval_result          = evaluate_with_hybrid(key_points, questions_data)
+
+            # questions_data here contains ONLY the current question (sent from frontend)
+            eval_result = evaluate_with_hybrid(key_points, questions_data)
 
             final_result = {
+                "student_name":   name,
                 "score":          eval_result["score"],
                 "total":          eval_result["total"],
                 "student_answer": student_answer_lines,
@@ -714,8 +712,6 @@ async def similarity(
                 "per_question":   eval_result["per_question"],
             }
 
-            # print(f"\n📝 [RAW OCR] Sheet {sheet_idx+1}:\n{raw_text}", flush=True)
-            # print(f"\n🧹 [CLEANED TEXT] Sheet {sheet_idx+1}:\n{cleaned_text}", flush=True)
             print(f"\n📦 [FINAL JSON] Sheet {sheet_idx+1}:\n{json.dumps(final_result, indent=2)}", flush=True)
 
             elapsed = time.time() - sheet_start
@@ -786,4 +782,4 @@ async def analyse(request: Request):
     except Exception as e:
         traceback.print_exc()
         print(f"❌ [ERROR] /analyse: {e}")
-        return {"error": str(e)}  
+        return {"error": str(e)}
